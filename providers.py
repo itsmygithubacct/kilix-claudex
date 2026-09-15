@@ -34,7 +34,7 @@ LIMIT_PROVIDERS = (*SUPPORTED, GROK_ID, QWEN_ID)
 LABELS.update({GROK_ID: "Grok", QWEN_ID: "Qwen"})
 USAGE_PAGES.update({
     GROK_ID: "https://grok.com/?_s=usage",
-    QWEN_ID: "https://modelstudio.console.alibabacloud.com/ap-southeast-1/subscription/token-plan/personal",
+    QWEN_ID: "https://home.qwencloud.com/billing/subscription/token-plan-individual",
 })
 GROK_HOME_ENV = "GROK_HOME"
 GROK_HOME_DIR = ".grok"

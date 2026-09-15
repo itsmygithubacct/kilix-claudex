@@ -1,0 +1,244 @@
+from contextlib import redirect_stderr, redirect_stdout
+import io
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
+import textwrap
+import unittest
+from unittest.mock import patch
+
+import browser
+import pane_loop as loop
+import providers
+import usage_pages
+
+NOW = 1789450000.0
+
+# Shapes: Codex wham/usage and Grok credits from omp 18.2.0's parsers; the companion
+# organization usage endpoint as documented by public trackers; Qwen from omp's
+# Token Plan console parser. Values are synthetic.
+CODEX_BODY = {"plan_type": "pro", "rate_limit": {
+    "allowed": True, "limit_reached": False,
+    "primary_window": {"used_percent": 42, "limit_window_seconds": 18000, "reset_after_seconds": 3600,
+                       "reset_at": NOW + 3600},
+    "secondary_window": {"used_percent": 18, "limit_window_seconds": 604800, "reset_at": NOW + 86400}},
+    "additional_rate_limits": [{"limit_name": "Spark", "rate_limit": {
+        "primary_window": {"used_percent": 5, "limit_window_seconds": 18000, "reset_after_seconds": 600}}}]}
+COMPANION_BODY = {"five_hour": {"utilization": 17.0, "resets_at": "2026-09-15T01:00:00Z"},
+                  "seven_day": {"utilization": 100.0, "resets_at": "2026-09-18T05:00:00Z"},
+                  "seven_day_opus": None, "seven_day_sonnet": {"utilization": 3, "resets_at": None},
+                  "extra_usage": {"is_enabled": False}}
+GROK_BODY = {"data": {"config": {"creditUsagePercent": 64.0, "currentPeriod": {
+    "type": "USAGE_PERIOD_TYPE_WEEKLY", "start": "2026-09-09T17:11:41Z", "end": "2026-09-16T17:11:41Z"},
+    "productUsage": [{"product": "Build", "usagePercent": 60}]}}}
+QWEN_BODY = {"code": "200", "successResponse": True, "data": {"Data": json.dumps({"DataV2": {"data": {"data": {
+    "per5HourPercentage": 0.25, "per5HourResetTime": int((NOW + 7200) * 1000),
+    "per1WeekPercentage": 64, "per1WeekResetTime": "2026-09-21T16:00:00Z"}}}})}}
+
+
+def page(body=None, url="https://example.com/settings/usage", final=None, title="Usage", text="", source=None):
+    responses = [] if body is None else [{"url": source or "https://example.com/api/usage", "status": 200, "body": body}]
+    return {"url": url, "final_url": final or url, "title": title, "text": text, "responses": responses}
+
+
+class ExtractorTests(unittest.TestCase):
+    def test_codex_windows_with_reset_fallback_and_named_extra_limits(self):
+        result = usage_pages.extract(providers.CODEX_ID, page(CODEX_BODY), now=NOW)
+        self.assertEqual((result["status"], result["plan"]), ("ok", "pro"))
+        windows = {w["name"]: w for w in result["windows"]}
+        self.assertEqual(list(windows), ["five_hour", "weekly", "spark_five_hour"])
+        self.assertEqual((windows["five_hour"]["used_percent"], windows["five_hour"]["resets_at"]), (42.0, NOW + 3600))
+        self.assertEqual(windows["spark_five_hour"]["resets_at"], NOW + 600)
+        self.assertEqual(result["evidence"], "example.com/api/usage")
+
+    def test_companion_windows_skip_empty_buckets(self):
+        result = usage_pages.extract(providers.COMPANION_ID, page(COMPANION_BODY), now=NOW)
+        self.assertEqual([w["name"] for w in result["windows"]], ["five_hour", "weekly", "weekly_sonnet"])
+        self.assertEqual(result["windows"][1]["remaining_percent"], 0.0)
+        self.assertIsNone(result["windows"][2]["resets_at"])
+
+    def test_grok_period_and_product_usage_are_found_when_nested(self):
+        result = usage_pages.extract(providers.GROK_ID, page(GROK_BODY), now=NOW)
+        weekly, product = result["windows"]
+        self.assertEqual((weekly["name"], weekly["used_percent"], weekly["window_seconds"]), ("weekly", 64.0, 7 * 86400))
+        self.assertEqual((product["label"], product["used_percent"]), ("weekly (Build)", 60.0))
+
+    def test_qwen_fractions_milliseconds_and_json_text_fields(self):
+        result = usage_pages.extract(providers.QWEN_ID, page(QWEN_BODY), now=NOW)
+        windows = {w["name"]: w for w in result["windows"]}
+        self.assertEqual((windows["five_hour"]["used_percent"], windows["five_hour"]["resets_at"]), (25.0, NOW + 7200))
+        self.assertEqual(windows["weekly"]["used_percent"], 64.0)
+
+    def test_the_newest_matching_response_wins(self):
+        older = {"five_hour": {"utilization": 1, "resets_at": None}}
+        view = page(older)
+        view["responses"].append({"url": "https://example.com/api/usage", "status": 200, "body": COMPANION_BODY})
+        self.assertEqual(usage_pages.extract(providers.COMPANION_ID, view)["windows"][0]["used_percent"], 17.0)
+
+    def test_pages_without_data_report_why(self):
+        extract = usage_pages.extract
+        self.assertEqual(extract(providers.COMPANION_ID, page(title="Just a moment..."))["status"], "challenge")
+        self.assertEqual(extract(providers.COMPANION_ID, page(final="https://example.com/login"))["status"],
+                         "login_required")
+        self.assertEqual(extract(providers.GROK_ID, page(final="https://example.com/"))["status"], "login_required")
+        self.assertIn("claudex usage login grok", extract(providers.GROK_ID, page(final="https://example.com/"))["reason"])
+        self.assertEqual(extract(providers.QWEN_ID, page({"unrelated": 1}))["status"], "unparsed")
+        # Signed-out answers observed on the live pages, which don't redirect.
+        self.assertEqual(extract(providers.GROK_ID, page({"status": "unauthenticated"}))["status"], "login_required")
+        self.assertEqual(extract(providers.QWEN_ID, page({"code": "ConsoleNeedLogin", "successResponse": False}))["status"],
+                         "login_required")
+        self.assertEqual(extract(providers.QWEN_ID, page(text="Log in to QwenCloud You are currently not logged in."))["status"],
+                         "login_required")
+
+
+class ReportTests(unittest.TestCase):
+    def report(self):
+        return {"read_at": NOW, "providers": {
+            providers.CODEX_ID: {"status": "ok", "checked_at": NOW, **usage_pages.codex_windows(CODEX_BODY, NOW)},
+            providers.GROK_ID: {"status": "login_required", "reason": "not signed in", "checked_at": NOW}}}
+
+    def test_table_shows_bars_percentages_resets_and_statuses(self):
+        text = usage_pages.format_report(self.report(), now=NOW)
+        self.assertIn("42.0% in 1h 0m", text)
+        self.assertIn("█████░░░░░░░", text)
+        self.assertIn("login_required", text)
+        self.assertNotIn("\x1b[", text)
+        self.assertIn("\x1b[32m", usage_pages.format_report(self.report(), now=NOW, color=True))
+
+    def test_exhaustion_and_cache_merging_keep_earlier_readings_private(self):
+        self.assertFalse(usage_pages.exhausted(self.report()))
+        full = {"providers": {providers.COMPANION_ID: {"status": "ok", **usage_pages.companion_windows(COMPANION_BODY, NOW)}}}
+        self.assertTrue(usage_pages.exhausted(full))
+        with tempfile.TemporaryDirectory() as folder:
+            cache = Path(folder) / "usage-pages.json"
+            usage_pages.merge_cache(cache, full)
+            merged = usage_pages.merge_cache(cache, self.report())
+            self.assertEqual(set(merged["providers"]), {providers.CODEX_ID, providers.GROK_ID, providers.COMPANION_ID})
+            self.assertEqual(stat.S_IMODE(cache.stat().st_mode), 0o600)
+
+    def test_debug_outline_keeps_numbers_and_times_but_not_text(self):
+        body = {"account": {"email": "someone@example.com"}, "five_hour": {"utilization": 17.0, "resets_at": "2026-09-15T01:00:00Z"}}
+        outline = usage_pages.debug_outline(page(body, source="https://example.com/api/org/123/usage?x=1"))
+        keys = outline["responses"][0]["keys"]
+        self.assertEqual(keys["account.email"], "<text 19>")
+        self.assertEqual((keys["five_hour.utilization"], keys["five_hour.resets_at"]), (17.0, "2026-09-15T01:00:00Z"))
+        self.assertEqual(outline["responses"][0]["url"], "example.com/api/org/123/usage")
+
+
+FAKE_CHROME = textwrap.dedent('''\
+    #!{python}
+    import json, os, sys
+    bodies = {{"r1": {{"five_hour": {{"utilization": 9, "resets_at": None}}}}, "r2": {{"other": 1}}}}
+    buffer = b""
+    def send(message):
+        os.write(4, json.dumps(message).encode() + b"\\0")
+    while True:
+        chunk = os.read(3, 65536)
+        if not chunk:
+            break
+        buffer += chunk
+        while b"\\0" in buffer:
+            raw, buffer = buffer.split(b"\\0", 1)
+            message = json.loads(raw)
+            method, reply = message["method"], {{}}
+            if method == "Target.createTarget":
+                reply = {{"targetId": "T1"}}
+            elif method == "Target.attachToTarget":
+                reply = {{"sessionId": "S1"}}
+            elif method == "Network.getResponseBody":
+                reply = {{"body": json.dumps(bodies[message["params"]["requestId"]]), "base64Encoded": False}}
+            elif method == "Runtime.evaluate":
+                reply = {{"result": {{"value": json.dumps({{"href": "https://example.com/usage", "title": "Usage", "text": "9% used"}})}}}}
+            send({{"id": message["id"], "result": reply}})
+            if method == "Page.navigate":
+                for rid, url, mime in (("r1", "https://api.example.com/usage", "application/json"),
+                                       ("r2", "https://other.org/usage", "application/json"),
+                                       ("r3", "https://example.com/app.js", "text/javascript")):
+                    send({{"sessionId": "S1", "method": "Network.responseReceived",
+                          "params": {{"requestId": rid, "response": {{"url": url, "status": 200, "mimeType": mime}}}}}})
+                    send({{"sessionId": "S1", "method": "Network.loadingFinished", "params": {{"requestId": rid}}}})
+                send({{"sessionId": "S1", "method": "Page.loadEventFired", "params": {{}}}})
+            if method == "Browser.close":
+                sys.exit(0)
+''')
+
+
+class BrowserTests(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.fake = Path(self.folder.name) / "fake-chrome"
+        self.fake.write_text(FAKE_CHROME.format(python=sys.executable))
+        self.fake.chmod(0o700)
+
+    def tearDown(self):
+        self.folder.cleanup()
+
+    def test_capture_keeps_json_from_the_page_domain_and_reads_the_page_text(self):
+        profile = Path(self.folder.name) / "profile"
+        chrome = browser.ChromePipe(profile, display="headless", binary=str(self.fake))
+        try:
+            captured = chrome.capture("https://example.com/usage", domains=("example.com",), timeout=5, settle=0.2)
+        finally:
+            chrome.close()
+        self.assertEqual([(r["url"], r["body"]) for r in captured["responses"]],
+                         [("https://api.example.com/usage", {"five_hour": {"utilization": 9, "resets_at": None}})])
+        self.assertEqual((captured["loaded"], captured["text"]), (True, "9% used"))
+        self.assertEqual(stat.S_IMODE(profile.stat().st_mode), 0o700)
+
+    def test_a_profile_held_by_a_live_chrome_is_busy(self):
+        profile = Path(self.folder.name) / "held"
+        profile.mkdir()
+        os.symlink(f"{os.uname().nodename}-{os.getpid()}", profile / "SingletonLock")
+        self.assertEqual(browser.profile_owner(profile), os.getpid())
+        with self.assertRaises(browser.ProfileBusy):
+            browser.private_profile(profile)
+        (profile / "SingletonLock").unlink()
+        os.symlink(f"{os.uname().nodename}-999999999", profile / "SingletonLock")
+        self.assertIsNone(browser.profile_owner(profile))
+
+
+class CommandTests(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.config = Path(self.folder.name) / "loop.json"
+
+    def tearDown(self):
+        self.folder.cleanup()
+
+    def run_main(self, *argv):
+        output = io.StringIO()
+        with redirect_stdout(output), redirect_stderr(io.StringIO()):
+            status = loop.main(["--config", str(self.config), "usage", *argv])
+        return status, output.getvalue()
+
+    def test_read_prints_json_caches_it_and_show_filters_the_cache(self):
+        report = {"read_at": NOW, "display": "virtual", "providers": {
+            providers.COMPANION_ID: {"status": "ok", "checked_at": NOW, **usage_pages.companion_windows(COMPANION_BODY, NOW)},
+            providers.GROK_ID: {"status": "login_required", "reason": "not signed in", "checked_at": NOW}}}
+        with patch.object(usage_pages, "read_usage", return_value=report) as read:
+            status, output = self.run_main(providers.COMPANION_ID, providers.GROK_ID, "--json", "--display", "headless")
+        self.assertEqual(status, 2)  # the weekly window is at 100%
+        self.assertEqual(read.call_args.args[0], [providers.COMPANION_ID, providers.GROK_ID])
+        self.assertEqual(read.call_args.kwargs["display"], "headless")
+        self.assertEqual(json.loads(output)["providers"][providers.GROK_ID]["status"], "login_required")
+        status, output = self.run_main("show", providers.GROK_ID)
+        self.assertEqual(status, 1)  # nothing readable among the shown agents
+        self.assertIn("login_required", output)
+        self.assertNotIn("weekly", output)
+
+    def test_login_opens_the_requested_pages_and_bad_agents_are_errors(self):
+        with patch.object(browser, "launch_login", return_value=4321) as launch:
+            status, output = self.run_main("login", providers.QWEN_ID, "--json")
+        self.assertEqual((status, json.loads(output)["pid"]), (0, 4321))
+        self.assertEqual(launch.call_args.args[1], [providers.USAGE_PAGES[providers.QWEN_ID]])
+        status, output = self.run_main("nonsense")
+        self.assertEqual((status, json.loads(output)["status"]), (1, "error"))
+        status, output = self.run_main("show")
+        self.assertIn("no usage pages have been read yet", output)
+
+
+if __name__ == "__main__":
+    unittest.main()

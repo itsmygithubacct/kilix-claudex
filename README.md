@@ -197,6 +197,41 @@ skipped`, exit 2) before typing; `send --allow-limited` overrides this. The
 optional `min_remaining_percent` in `loop.json` also skips targets below that
 remaining percentage.
 
+### Reading the usage pages
+
+`claudex usage` reads each agent's official usage page in a dedicated Chrome
+profile and prints its percentages and reset times. Sign in once:
+
+```sh
+claudex usage login                # open every usage page in the claudex browser profile
+claudex usage                      # read all four pages and print a report
+claudex usage codex grok           # read only these agents
+claudex usage show                 # the last reading, without opening a browser
+claudex usage status               # profile path, whether it's open, time of the last reading
+claudex usage --json
+```
+
+- **Profile:** `usage-browser/` in the app data directory, mode 0700. It holds
+  your logins for these sites; claudex never reads its cookies. Delete the
+  directory to sign out everywhere. Close the login window before reading,
+  because Chrome can't open one profile twice.
+- **Browser:** Chrome runs on a private Xvfb display by default.
+  `--display screen` shows the window, and `--display headless` uses headless
+  Chrome. claudex speaks to it over `--remote-debugging-pipe`, which opens no
+  network port. Chrome marks such a session as automated, and claudex doesn't
+  hide that; signing in happens in an ordinary window.
+- **Data:** numbers come from the JSON each page requests, not from its layout:
+  Codex `rate_limit` windows, the companion agent's `five_hour` and
+  `seven_day` utilization, Grok `creditUsagePercent` with `currentPeriod`, and
+  Qwen Token Plan `per5HourPercentage` and `per1WeekPercentage`.
+- **Statuses:** `login_required` (run `claudex usage login AGENT`),
+  `challenge` (a bot check; retry with `--display screen` and complete it),
+  `unparsed` (rerun with `--debug`, which writes an outline of each page's JSON
+  keys to `.loop/usage-debug-AGENT.json`, keeping numbers and timestamps and
+  redacting other text) or `error`.
+- **Output:** the latest reading per agent is kept in `.loop/usage-pages.json`.
+  Exit codes: 0 read, 2 a window is at 100%, 1 nothing could be read.
+
 ## Periodic prompts
 
 ```sh

@@ -18,10 +18,12 @@ import time
 import urllib.request
 import uuid
 
+import browser
 import dashboard
 from idleness import codex_queue_hint, composer_is_empty, composer_text
 from limits import CodexHistory, assess_limits, limit_report, pane_agent
-from providers import CODEX_ID, COMPANION_ID, LIMIT_PROVIDERS, SUPPORTED
+from providers import CODEX_ID, COMPANION_ID, LIMIT_PROVIDERS, SUPPORTED, USAGE_PAGES
+import usage_pages
 
 
 ALIASES = {"orchestrator": "claudex-orchestrator", "companion": "claudex-companion"}
@@ -29,6 +31,7 @@ ALIASES = {"orchestrator": "claudex-orchestrator", "companion": "claudex-compani
 MIN_INTERVAL_MINUTES = 0.01
 DEFAULT_DASHBOARD_PORT = 8797
 DEFAULT_TARGETS = ["orchestrator", "companion"]
+USAGE_ACTIONS = ("read", "login", "show", "status")
 
 
 def default_config():
@@ -814,7 +817,68 @@ def parser():
     board_actions.add_parser("status", help="report whether the dashboard is running")
     provider = board_actions.add_parser("provider", help="open official usage pages in kilix browse tabs")
     provider.add_argument("which", nargs="?", choices=(*LIMIT_PROVIDERS, "all"), default="all")
+    usage = commands.add_parser("usage", help="read percentages and reset times from the official usage pages")
+    usage.add_argument("words", nargs="*", metavar="[read|login|show|status] [AGENT ...]",
+                       help=f"action (default read) and agents: {', '.join(LIMIT_PROVIDERS)} (default all)")
+    usage.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    usage.add_argument("--display", choices=browser.DISPLAYS, default="virtual",
+                       help="virtual: private Xvfb (default); screen: visible window; headless")
+    usage.add_argument("--browser", metavar="COMMAND", help="Chrome executable (default google-chrome)")
+    usage.add_argument("--timeout", type=float, default=45.0, metavar="SECONDS", help="per page (default 45)")
+    usage.add_argument("--debug", action="store_true", help="write a redacted outline of each page's JSON keys")
     return result
+
+
+def usage_command(args, config_path, runtime):
+    words = list(args.words)
+    action = words.pop(0) if words and words[0] in USAGE_ACTIONS else "read"
+    unknown = [word for word in words if word not in LIMIT_PROVIDERS]
+    if unknown:
+        raise LoopError(f"unknown agent {unknown[0]!r}; choose from {', '.join(LIMIT_PROVIDERS)}")
+    providers = list(dict.fromkeys(words)) or list(LIMIT_PROVIDERS)
+    profile = config_path.parent / "usage-browser"
+    cache = runtime / "usage-pages.json"
+    if action == "login":
+        pid = browser.launch_login(profile, [USAGE_PAGES[name] for name in providers], args.browser)
+        value = {"status": "opened", "pid": pid, "profile": str(profile),
+                 "pages": {name: USAGE_PAGES[name] for name in providers},
+                 "next": "sign in on each page, close the window, then run: claudex usage"}
+        if args.json:
+            print(json.dumps(value, indent=2, ensure_ascii=False))
+        else:
+            print(f"Opened Chrome on the claudex usage profile (pid {pid}):")
+            for name in providers:
+                print(f"  {name:<7} {USAGE_PAGES[name]}")
+            print("Sign in on each page, close the window, then run: claudex usage")
+        return 0
+    if action == "status":
+        try:
+            last = json.loads(cache.read_text(encoding="utf-8")).get("read_at")
+        except (OSError, ValueError):
+            last = None
+        print(json.dumps({"profile": str(profile), "profile_exists": profile.is_dir(),
+                          "open_pid": browser.profile_owner(profile), "cache": str(cache), "last_read_at": last},
+                         indent=2))
+        return 0
+    if action == "read":
+        if not math.isfinite(args.timeout) or args.timeout <= 0:
+            raise LoopError("--timeout must be a positive number of seconds")
+        report = usage_pages.read_usage(providers, profile, display=args.display, binary=args.browser,
+                                        timeout=args.timeout, debug_dir=runtime if args.debug else None)
+        usage_pages.merge_cache(cache, report)
+    else:
+        try:
+            report = json.loads(cache.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise LoopError("no usage pages have been read yet; run: claudex usage") from None
+        report["providers"] = {name: entry for name, entry in (report.get("providers") or {}).items()
+                               if name in providers}
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        print(usage_pages.format_report(report, color=sys.stdout.isatty() and not os.environ.get("NO_COLOR")))
+    readable = any(entry.get("status") == "ok" for entry in report["providers"].values())
+    return 2 if usage_pages.exhausted(report) else 0 if readable else 1
 
 
 def utf8_streams():
@@ -917,6 +981,8 @@ def main(argv=None):
             worst = next((state for state in ("exhausted", "low", "ok")
                           if any(r["state"] == state for r in reports)), "unknown")
             value = {"status": worst, "panes": reports}
+        elif args.command == "usage":
+            return usage_command(args, config_path, runtime)
         elif args.command == "dashboard":
             if args.action in ("serve", "start", "open"):
                 if not 0 <= args.port <= 65535:
@@ -945,7 +1011,7 @@ def main(argv=None):
         print(json.dumps({"status": "skipped", "reason": str(error), "text_attempted": False,
                           "text_may_remain": False}))
         return 2
-    except (LoopError, OSError, ValueError) as error:
+    except (LoopError, browser.BrowserError, OSError, ValueError) as error:
         value = getattr(error, "evidence", None) or {"status": "error", "reason": str(error),
                                                     "text_attempted": False, "text_may_remain": False}
         print(json.dumps(value, ensure_ascii=False))
