@@ -1,0 +1,6 @@
+{
+  "target": "claudex-orchestrator",
+  "interval_minutes": 5,
+  "prompt_file": "prompt.txt",
+  "enabled": false
+}

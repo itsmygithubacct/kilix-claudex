@@ -1,0 +1,1 @@
+Review the current task and continue any unfinished work the user has authorized. If the task is complete, report briefly and wait for new instructions. Avoid acknowledgement loops.
