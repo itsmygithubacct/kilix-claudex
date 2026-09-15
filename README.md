@@ -100,9 +100,10 @@ recorded turn. `screen_changed_after_submit` covers either key; the older
 ```sh
 claudex limits                     # both claudex panes
 claudex limits orchestrator --low 5
+claudex limits 182 190             # any pane ID, including grok and omp (Qwen) panes
 ```
 
-`limits` prints JSON for each pane: its weekly and five-hour windows, `state`
+`limits` prints JSON for each pane: its weekly, five-hour or monthly windows, `state`
 (`exhausted`, `low`, `ok` or `unknown`), the evidence sources, and which
 windows the agent doesn't report. It exits 2 when any pane is exhausted. It
 reads local files and the screen only; it never types into a pane.
@@ -117,14 +118,35 @@ reads local files and the screen only; it never types into a pane.
   rejected requests with `quotaLimits` (`five_hour` or `seven_day`, reset
   time), so a companion window is exhausted until its reset, or unknown. Its
   configuration directory variable and default are defined in `providers.py`.
+- **Grok:** Grok Build logs its credit allowance to
+  `$GROK_HOME/logs/unified.jsonl` (default `~/.grok`) while a session is open:
+  `creditUsagePercent` and the current weekly or monthly period with its end.
+  Grok has no five-hour window. The newest record wins, so after grok closes the
+  last observed value remains until the period ends.
+- **Qwen:** Qwen Token Plan panes run `omp --model qwen-token-plan/...` (or
+  omp's built-in `alibaba-token-plan`). omp records no usage percentage, so
+  the local evidence is a rejected request (`stopReason: error` with a quota
+  message) in its sessions under `$PI_CODING_AGENT_DIR/sessions` (default
+  `~/.omp/agent`). A rejection counts until a later Token Plan request succeeds
+  or its window has elapsed. The Token Plan's 7-day window starts at the first
+  call; its five-hour limit wasn't enforced as of September 2026. `omp usage`
+  reports Token Plan percentages only for an `alibaba-token-plan` account signed
+  in with console cookies; claudex never handles those credentials.
 - **Screen:** line-start warnings such as `less than 5% of your weekly limit
-  left` or `hit your usage limit`. Fresh file evidence outranks possibly stale
-  scrollback.
+  left`, `hit your usage limit`, `You hit your weekly limit` or `Allocated
+  quota exceeded`. Fresh file evidence outranks possibly stale scrollback.
+
+Pane Center identifies Codex and companion panes. Grok and omp panes are
+recognized from their foreground command, and an omp pane counts as Qwen when its
+model (from `--model` or its newest session in that directory) belongs to a
+Token Plan provider. Grok and Qwen panes are monitored for limits only; `send`,
+`idle` and the timer support Codex and the companion agent.
 
 `limits --history` adds the current window's usage history. It also adds burn
 rate: a least-squares percent per hour over the last hour for five-hour windows
 and the last 6 hours for weekly ones. It projects when the window runs out and
-whether that happens before the reset. The companion agent gets its recent rejection events.
+whether that happens before the reset, for Codex and Grok. The companion agent and Qwen get
+their recent rejection events.
 
 ### Dashboard and official usage pages
 
@@ -134,8 +156,9 @@ claudex dashboard start --port 8797
 claudex dashboard status
 claudex dashboard stop
 claudex dashboard serve            # foreground
-claudex dashboard provider         # both agents' official usage pages (URLs in providers.py)
+claudex dashboard provider         # every agent's official usage page (URLs in providers.py)
 claudex dashboard provider codex
+claudex dashboard provider grok
 ```
 
 The dashboard is a local, read-only page. It shows a bar, reset countdown,
@@ -164,7 +187,7 @@ does.
   titled tab for it.
 
 The official pages are the authoritative numbers, including the companion agent's
-percentages, which aren't available locally. `/api/health` reports page, limits
+and Qwen Token Plan percentages, which aren't available locally. `/api/health` reports page, limits
 and health request counts, so you can confirm a browser page is loaded and
 polling.
 

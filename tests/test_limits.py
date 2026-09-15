@@ -8,6 +8,11 @@ import unittest
 import limits
 import providers
 
+# Limit detection reads account-wide files; never let tests see real ones.
+for variable in (providers.CODEX_HOME_ENV, providers.COMPANION_CONFIG_ENV, providers.GROK_HOME_ENV,
+                 providers.OMP_AGENT_DIR_ENV):
+    os.environ[variable] = tempfile.mkdtemp(prefix="claudex-test-")
+
 NOW = 1789450000.0
 
 
@@ -54,6 +59,47 @@ def codex_pane(path=None):
 
 def companion_pane(session_id="11111111-2222-3333-4444-555555555555"):
     return {"pane_id": 2, "coding_session": {"provider": providers.COMPANION_ID, "session_id": session_id, "path": None}}
+
+
+def grok_billing(epoch, used, start, end, kind="USAGE_PERIOD_TYPE_WEEKLY", prepaid=0):
+    # Shape of a grok 1.0.25 unified.jsonl billing record, account details omitted.
+    return {"ts": iso(epoch), "src": "shell", "pid": 4242, "ver": "1.0.25", "lvl": "info",
+            "msg": "billing: fetched credits config",
+            "ctx": {"config": {"creditUsagePercent": used,
+                               "currentPeriod": {"type": kind, "start": iso(start), "end": iso(end)},
+                               "onDemandCap": {"val": 0}, "onDemandUsed": {"val": 0},
+                               "prepaidBalance": {"val": prepaid}, "isUnifiedBillingUser": True,
+                               "billingPeriodStart": iso(start), "billingPeriodEnd": iso(end), "historyLen": 0},
+                    "onDemandEnabled": False, "subscriptionTier": "SuperGrok"}}
+
+
+def grok_pane(cwd="/srv/work"):
+    return {"pane_id": 3, "cwd": cwd, "coding_session": None,
+            "process": {"name": "grok", "argv": ["grok"],
+                        "foreground": [{"pid": 7, "argv": ["/opt/grok/bin/grok", "--continue"], "cwd": cwd}]}}
+
+
+def omp_pane(model="qwen-token-plan/qwen3.8-max", cwd="/srv/work"):
+    argv = ["omp", "--model", model] if model else ["omp"]
+    return {"pane_id": 4, "cwd": cwd, "coding_session": None,
+            "process": {"name": "omp", "argv": argv, "foreground": [{"pid": 8, "argv": argv, "cwd": cwd}]}}
+
+
+def omp_session(cwd, model="qwen-token-plan/qwen3.8-max", epoch=NOW - 7200):
+    # Header records from an omp 18.2.0 session file.
+    return [{"type": "title", "v": 1, "title": "", "source": "", "updatedAt": iso(epoch)},
+            {"type": "session", "version": 3, "id": "01a0a642", "timestamp": iso(epoch), "cwd": cwd},
+            {"type": "model_change", "id": "bd5e5080", "parentId": None, "timestamp": iso(epoch), "model": model}]
+
+
+def omp_reply(epoch, error=None, provider="qwen-token-plan"):
+    # Assistant record shape from an omp 18.2.0 session. A failed request carries stopReason
+    # "error" and errorMessage; the 429 text is Alibaba's documented Token Plan rejection.
+    message = {"role": "assistant", "api": "openai-completions", "provider": provider, "model": "qwen3.8-max",
+               "stopReason": "error" if error else "stop", "timestamp": int(epoch * 1000)}
+    if error:
+        message["errorMessage"] = error
+    return {"type": "message", "id": f"r{int(epoch)}", "timestamp": iso(epoch), "message": message}
 
 
 class TailTests(unittest.TestCase):
@@ -186,6 +232,105 @@ class CompanionTests(unittest.TestCase):
         self.assertEqual(self.assess(companion_pane())["state"], "unknown")
 
 
+class GrokTests(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.home = Path(self.folder.name) / "grok"
+        self.log = self.home / "logs" / "unified.jsonl"
+
+    def tearDown(self):
+        self.folder.cleanup()
+
+    def assess(self, pane, text=None, **kwargs):
+        return limits.assess_limits(pane, text, now=NOW, grok_home=self.home,
+                                    omp_home=Path(self.folder.name) / "omp", **kwargs)
+
+    def test_a_grok_pane_is_detected_from_its_command_and_reports_the_weekly_period(self):
+        start, end = NOW - 3 * 86400, NOW + 4 * 86400
+        write_lines(self.log, [grok_billing(NOW - 600, 62.5, start, end), grok_billing(NOW - 30, 64.0, start, end)],
+                    filler=2)
+        result = self.assess(grok_pane())
+        self.assertEqual((result["agent"], result["detected_from"], result["state"]), ("grok", "process", "ok"))
+        weekly = result["windows"]["weekly"]
+        self.assertEqual((weekly["used_percent"], weekly["window_minutes"], weekly["resets_in_seconds"]),
+                         (64.0, 10080, 4 * 86400))
+        self.assertEqual((result["not_reported"], result["plan_type"]), (["five_hour"], "SuperGrok"))
+
+    def test_a_used_allowance_is_exhausted_until_its_period_ends(self):
+        write_lines(self.log, [grok_billing(NOW - 60, 100.0, NOW - 86400, NOW + 6 * 86400, prepaid=212)])
+        result = self.assess(grok_pane())
+        self.assertEqual(result["state"], "exhausted")
+        self.assertIn("prepaid balance 212", result["note"])
+        write_lines(self.log, [grok_billing(NOW - 8 * 86400, 100.0, NOW - 14 * 86400, NOW - 7 * 86400)])
+        self.assertEqual(self.assess(grok_pane())["state"], "unknown")
+
+    def test_monthly_periods_keep_their_name(self):
+        write_lines(self.log, [grok_billing(NOW - 60, 20.0, NOW - 10 * 86400, NOW + 20 * 86400,
+                                            kind="USAGE_PERIOD_TYPE_MONTHLY")])
+        result = self.assess(grok_pane())
+        self.assertEqual((list(result["windows"]), result["not_reported"]), (["monthly"], ["weekly", "five_hour"]))
+
+    def test_limit_report_adds_the_current_period_history_and_burn_rate(self):
+        start, end = NOW - 86400, NOW + 6 * 86400
+        write_lines(self.log, [grok_billing(NOW - 5 * 86400, 90.0, NOW - 8 * 86400, NOW - 86400)]
+                    + [grok_billing(NOW - 3600 + i * 600, 40.0 + i, start, end) for i in range(7)])
+        report = limits.limit_report(grok_pane(), now=NOW, grok_home=self.home,
+                                     omp_home=Path(self.folder.name) / "omp")
+        weekly = report["windows"]["weekly"]
+        self.assertEqual([used for _, used in weekly["history"]], [40.0 + i for i in range(7)])
+        self.assertAlmostEqual(weekly["burn_percent_per_hour"], 6.0, places=1)
+
+
+class QwenTests(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.home = Path(self.folder.name) / "omp"
+
+    def tearDown(self):
+        self.folder.cleanup()
+
+    def assess(self, pane, text=None, **kwargs):
+        return limits.assess_limits(pane, text, now=NOW, omp_home=self.home,
+                                    grok_home=Path(self.folder.name) / "grok", **kwargs)
+
+    def write(self, folder, cwd, replies, model="qwen-token-plan/qwen3.8-max"):
+        write_lines(self.home / "sessions" / folder / "2026-09-15T00-00-00-000Z_01a0a642.jsonl",
+                    omp_session(cwd, model) + replies)
+
+    def test_a_seven_day_rejection_is_exhausted_until_a_later_request_succeeds(self):
+        rejection = "429 Allocated quota exceeded: 7-day limit exhausted"
+        self.write("-srv-work", "/srv/work", [omp_reply(NOW - 900), omp_reply(NOW - 300, error=rejection)])
+        result = self.assess(omp_pane())
+        self.assertEqual((result["agent"], result["state"]), ("qwen", "exhausted"))
+        self.assertEqual((result["windows"]["weekly"]["status"], result["model"]),
+                         ("rejected", "qwen-token-plan/qwen3.8-max"))
+        self.assertEqual(result["events"][0]["limit_type"], "weekly")
+        self.write("-srv-work", "/srv/work", [omp_reply(NOW - 300, error=rejection), omp_reply(NOW - 60)])
+        result = self.assess(omp_pane())
+        self.assertEqual(result["state"], "unknown")
+        self.assertIn("a later request succeeded", result["reason"])
+
+    def test_the_model_comes_from_the_session_when_the_command_names_none(self):
+        self.write("-srv-app", "/srv/app", [omp_reply(NOW - 120)])
+        result = self.assess(omp_pane(model=None, cwd="/srv/app"))
+        self.assertEqual((result["agent"], result["state"]), ("qwen", "unknown"))
+        self.assertIn("last successful request 2m ago", result["reason"])
+        self.assertEqual(self.assess(omp_pane(model="ollama/qwen3.8:27b"))["agent"], "")
+
+    def test_rejections_are_account_wide_and_other_errors_are_ignored(self):
+        self.write("-srv-other", "/srv/other", [
+            omp_reply(NOW - 400, error="429 Allocated quota exceeded: 5-hour limit exhausted"),
+            omp_reply(NOW - 200, error="400 Range of input length error-code/#token-limit you exceeded your current quota"),
+            omp_reply(NOW - 100, error="Provider finish_reason: network_error"),
+            omp_reply(NOW - 50, error="429 quota exceeded", provider="ollama")])
+        result = self.assess(omp_pane())
+        self.assertEqual((list(result["windows"]), result["state"]), (["five_hour"], "exhausted"))
+
+    def test_a_rejection_older_than_its_window_does_not_count(self):
+        self.write("-srv-work", "/srv/work", [omp_reply(NOW - 6 * 3600, error="429 Allocated quota exceeded: 5 hour limit")])
+        self.assertEqual(self.assess(omp_pane())["state"], "unknown")
+
+
 class HistoryTests(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
@@ -273,7 +418,8 @@ class ScreenTests(unittest.TestCase):
     def assess(self, pane, text, **kwargs):
         with tempfile.TemporaryDirectory() as folder:
             return limits.assess_limits(pane, text, now=NOW, codex_home=Path(folder) / "c",
-                                        companion_home=Path(folder) / "d", **kwargs)
+                                        companion_home=Path(folder) / "d", grok_home=Path(folder) / "g",
+                                        omp_home=Path(folder) / "o", **kwargs)
 
     def test_codex_warning_line_is_low(self):
         text = "\x1b[33m⚠ Heads up, you have less than 5% of your weekly limit left. Run /status\x1b[0m\n› Ask Codex"
@@ -301,6 +447,13 @@ class ScreenTests(unittest.TestCase):
 
     def test_other_panes_are_unknown(self):
         self.assertEqual(limits.assess_limits({"coding_session": {"provider": "bash"}})["state"], "unknown")
+
+    def test_grok_and_qwen_limit_lines(self):
+        self.assertEqual(self.assess(grok_pane(), "  You hit your weekly limit.\n")["state"], "exhausted")
+        self.assertEqual(self.assess(grok_pane(), "You’ve reached your free Grok Build usage limit for now.\n")["state"],
+                         "exhausted")
+        self.assertEqual(self.assess(omp_pane(), "Error: 429 Allocated quota exceeded\n")["state"], "exhausted")
+        self.assertEqual(self.assess(grok_pane(), "You've reached the model context limit\n")["state"], "unknown")
 
 
 if __name__ == "__main__":

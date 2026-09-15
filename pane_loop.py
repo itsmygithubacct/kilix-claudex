@@ -20,8 +20,8 @@ import uuid
 
 import dashboard
 from idleness import codex_queue_hint, composer_is_empty, composer_text
-from limits import CodexHistory, assess_limits, limit_report
-from providers import CODEX_ID, COMPANION_ID, SUPPORTED
+from limits import CodexHistory, assess_limits, limit_report, pane_agent
+from providers import CODEX_ID, COMPANION_ID, LIMIT_PROVIDERS, SUPPORTED
 
 
 ALIASES = {"orchestrator": "claudex-orchestrator", "companion": "claudex-companion"}
@@ -795,7 +795,7 @@ def parser():
     send.add_argument("--allow-limited", action="store_true",
                       help="send even when the target's token limit is exhausted")
     commands.add_parser("verify", help="recheck recorded-turn evidence for the most recent send")
-    limit = commands.add_parser("limits", help="report weekly and five-hour token limits for panes")
+    limit = commands.add_parser("limits", help="report weekly, five-hour and monthly token limits for agent panes")
     limit.add_argument("targets", nargs="*", default=["orchestrator", "companion"])
     limit.add_argument("--low", type=float, default=10.0, metavar="PERCENT",
                        help="remaining percentage reported as low (default 10)")
@@ -813,7 +813,7 @@ def parser():
     board_actions.add_parser("stop", help="stop the background dashboard")
     board_actions.add_parser("status", help="report whether the dashboard is running")
     provider = board_actions.add_parser("provider", help="open official usage pages in kilix browse tabs")
-    provider.add_argument("which", nargs="?", choices=(*SUPPORTED, "all"), default="all")
+    provider.add_argument("which", nargs="?", choices=(*LIMIT_PROVIDERS, "all"), default="all")
     return result
 
 
@@ -879,7 +879,7 @@ def main(argv=None):
             if not args.json:
                 print(f"{'PANE':<7} {'TITLE':<26} {'ACTIVITY':<12} AGENT")
                 for pane in value["panes"]:
-                    provider = (pane.get("coding_session") or {}).get("provider", "-")
+                    provider = pane_agent(pane)[0] or "-"
                     print(f"{pane['pane_id']:<7} {pane.get('title', ''):<26} "
                           f"{pane.get('activity', ''):<12} {provider}")
                 return 0
@@ -935,7 +935,7 @@ def main(argv=None):
                 state = start_dashboard(config_path, runtime, args.port, args.targets, args.low)
                 value = {"dashboard": state, "browser": launch_browser(state["url"], "claudex-limits")}
             else:
-                names = list(SUPPORTED) if args.which == "all" else [args.which]
+                names = list(LIMIT_PROVIDERS) if args.which == "all" else [args.which]
                 value = {"opened": [launch_browser(dashboard.PROVIDER_PAGES[name], f"{name}-usage")
                                     for name in names]}
         print(json.dumps(value, indent=2, ensure_ascii=False))

@@ -16,6 +16,8 @@ import providers  # noqa: E402
 
 os.environ[providers.CODEX_HOME_ENV] = tempfile.mkdtemp(prefix="claudex-test-codex-")
 os.environ[providers.COMPANION_CONFIG_ENV] = tempfile.mkdtemp(prefix="claudex-test-companion-")
+os.environ[providers.GROK_HOME_ENV] = tempfile.mkdtemp(prefix="claudex-test-grok-")
+os.environ[providers.OMP_AGENT_DIR_ENV] = tempfile.mkdtemp(prefix="claudex-test-omp-")
 
 import pane_loop as loop
 from idleness import assess_idle

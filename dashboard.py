@@ -176,7 +176,7 @@ footer { padding:0 1.25rem 1.25rem; }
   <span id="pages"></span>
 </header>
 <main id="cards"></main>
-<footer class="dim">Local files and pane screens only · weekly and five-hour windows where the agent reports them ·
+<footer class="dim">Local files and pane screens only · weekly, five-hour and monthly windows where the agent reports them ·
   unknown never blocks sends</footer>
 <script nonce="{{NONCE}}">
 "use strict";
@@ -213,7 +213,8 @@ function windowBlock(name, w) {
     box.append(row);
   }
   const facts = [];
-  if (w.reset_since_observed) facts.push("reset since observed");
+  if (w.superseded_by_success_at) facts.push("a later request succeeded");
+  else if (w.reset_since_observed) facts.push("reset since observed");
   else if (w.resets_in_seconds !== null && w.resets_in_seconds !== undefined) facts.push(`resets in ${duration(w.resets_in_seconds)}`);
   if (w.burn_percent_per_hour !== null && w.burn_percent_per_hour !== undefined) facts.push(`burn ${w.burn_percent_per_hour}%/h`);
   else if (w.history) facts.push("no recent burn (idle)");
@@ -234,6 +235,8 @@ function card(p) {
   top.append($("span", `badge ${p.state || "unknown"}`, p.state || "unknown"));
   el.append(top, $("div", "dim", p.reason || ""));
   if (p.limit_id) el.append($("div", "dim", `limit bucket ${p.limit_id}${p.plan_type ? ` · plan ${p.plan_type}` : ""}${p.age_seconds !== undefined && p.age_seconds !== null ? ` · newest evidence ${duration(p.age_seconds)} old` : ""}`));
+  if (p.model) el.append($("div", "dim", `model ${p.model}${p.detected_from ? ` · detected from ${p.detected_from}` : ""}`));
+  if (p.last_success_at) el.append($("div", "dim", `last successful request ${duration(Date.now() / 1000 - p.last_success_at)} ago`));
   for (const [name, w] of Object.entries(p.windows || {})) el.append(windowBlock(name, w));
   if ((p.not_reported || []).length && Object.keys(p.windows || {}).length) el.append($("div", "dim", `not reported: ${p.not_reported.join(", ")}`));
   if (p.note) el.append($("div", "dim", p.note));
