@@ -7,7 +7,7 @@ page itself requests, so nothing depends on page layout:
 
     codex   rate_limit.primary_window / secondary_window: used_percent, limit_window_seconds, reset_at
     companion  five_hour / seven_day / seven_day_<model>: utilization, resets_at
-    grok    creditUsagePercent, currentPeriod {type, start, end}, productUsage
+    grok    GrokBuildBilling/GetGrokCreditsConfig (gRPC-web protobuf), else the rendered limit text
     qwen    per5HourPercentage / per1WeekPercentage with per*ResetTime
 
 claudex never reads the profile's cookies, and it doesn't store response bodies
@@ -15,12 +15,14 @@ except as a redacted key outline with ``--debug``.
 """
 from __future__ import annotations
 
+import base64
 from contextlib import nullcontext
 from datetime import datetime
 import json
 import os
 from pathlib import Path
 import re
+import struct
 import tempfile
 import time
 from urllib.parse import urlsplit
@@ -35,6 +37,10 @@ _SIGNED_OUT_TEXT = re.compile(r"not (?:currently )?(?:logged|signed) in|you need
                               r"|sign in to continue", re.I)
 _SIGNED_OUT_CODE = re.compile(r"need_?login|not_?login|unauthori[sz]ed", re.I)
 _QWEN_KEY = re.compile(r"^per(\d+)(Hour|Day|Week|Month)Percentage$")
+GROK_CREDITS_METHOD = "GetGrokCreditsConfig"
+_GROK_LIMIT = re.compile(r"^(Weekly|Monthly|Daily)\s+(.*?)\s*Limit$", re.I)
+_GROK_RESETS = re.compile(r"^Resets\s+([A-Z][a-z]+ \d{1,2}, \d{4}) at (\d{1,2}:\d{2}\s*[AP]M)$", re.I)
+_PERCENT_LINE = re.compile(r"^(\d{1,3}(?:\.\d+)?)\s*%$")
 
 
 def page_domain(url: str) -> str:
@@ -85,7 +91,7 @@ def codex_windows(body: dict, now: float):
         return None
     found = []
 
-    def add(rate, prefix=""):
+    def add(rate, prefix="", title=""):
         for slot, fallback in (("primary_window", "primary"), ("secondary_window", "secondary")):
             item = rate.get(slot) if isinstance(rate, dict) else None
             if not isinstance(item, dict) or _number(item.get("used_percent")) is None:
@@ -96,12 +102,12 @@ def codex_windows(body: dict, now: float):
                 resets = now + item["reset_after_seconds"]
             name = _named(seconds, fallback)
             found.append(window(f"{prefix}{name}", item["used_percent"], resets, seconds=seconds,
-                                label=f"{prefix.replace('_', ' ')}{name}"))
+                                label=f"{title} {name}" if title else name))
 
     add(limits)
     for extra in body.get("additional_rate_limits") or []:
         if isinstance(extra, dict) and extra.get("limit_name"):
-            add(extra.get("rate_limit"), f"{str(extra['limit_name']).lower()}_")
+            add(extra.get("rate_limit"), f"{str(extra['limit_name']).lower()}_", str(extra["limit_name"]))
     return {"windows": found, "plan": body.get("plan_type")} if found else None
 
 
@@ -151,6 +157,132 @@ def qwen_windows(body: dict, now: float):
     return {"windows": found} if found else None
 
 
+# --- grok: gRPC-web protobuf, decoded without a schema -----------------------
+#
+# Field numbers were matched against grok's own billing log for the same account:
+# config = 1; creditUsagePercent = 1.1 (float); billing period start/end = 1.4 / 1.5;
+# currentPeriod = 1.8 {1 type enum, 2 start, 3 end}; timestamps are {1 seconds, 2 nanos}.
+
+def _varint(data: bytes, index: int) -> tuple[int, int]:
+    shift = value = 0
+    while True:
+        if index >= len(data) or shift > 63:
+            raise ValueError("truncated varint")
+        byte = data[index]
+        index += 1
+        value |= (byte & 0x7F) << shift
+        shift += 7
+        if not byte & 0x80:
+            return value, index
+
+
+def protobuf_fields(data: bytes) -> list[tuple[int, int, object]]:
+    """``(field, wire type, value)``; length-delimited values stay bytes for the caller to decode."""
+    fields, index = [], 0
+    while index < len(data):
+        key, index = _varint(data, index)
+        number, wire = key >> 3, key & 7
+        if number == 0:
+            raise ValueError("field number 0")
+        if wire == 0:
+            value, index = _varint(data, index)
+        elif wire in (1, 5):
+            size = 8 if wire == 1 else 4
+            value, index = data[index:index + size], index + size
+            if len(value) < size:
+                raise ValueError("truncated fixed field")
+        elif wire == 2:
+            size, index = _varint(data, index)
+            value, index = data[index:index + size], index + size
+            if len(value) < size:
+                raise ValueError("truncated bytes field")
+        else:
+            raise ValueError(f"unsupported wire type {wire}")
+        fields.append((number, wire, value))
+    return fields
+
+
+def _message(data) -> list | None:
+    if not isinstance(data, (bytes, bytearray)):
+        return None
+    try:
+        return protobuf_fields(bytes(data))
+    except ValueError:
+        return None
+
+
+def _field(fields, number: int, wire: int):
+    return next((value for n, w, value in fields or [] if n == number and w == wire), None)
+
+
+def _timestamp(data) -> float | None:
+    fields = _message(data)
+    seconds = _field(fields, 1, 0)
+    return seconds + (_field(fields, 2, 0) or 0) / 1e9 if isinstance(seconds, int) and seconds > 0 else None
+
+
+def grpc_web_messages(data: bytes) -> list[bytes]:
+    messages, index = [], 0
+    while index + 5 <= len(data):
+        flag, size = data[index], struct.unpack(">I", data[index + 1:index + 5])[0]
+        payload, index = data[index + 5:index + 5 + size], index + 5 + size
+        if not flag & 0x80:  # 0x80 marks the trailers frame
+            messages.append(payload)
+    return messages
+
+
+def _period_name(seconds) -> str:
+    if seconds and 6 * 86400 <= seconds <= 8 * 86400:
+        return "weekly"
+    if seconds and 27 * 86400 <= seconds <= 32 * 86400:
+        return "monthly"
+    return _named(round(seconds) if seconds else None, "period")
+
+
+def grok_grpc_windows(raw: str, now: float):
+    try:
+        data = base64.b64decode(raw, validate=True)
+    except ValueError:
+        return None
+    for payload in grpc_web_messages(data):
+        config = _message(_field(_message(payload), 1, 2))
+        used_bytes = _field(config, 1, 5)
+        if not config or used_bytes is None:
+            continue
+        period = _message(_field(config, 8, 2))
+        start = _timestamp(_field(period, 2, 2)) or _timestamp(_field(config, 4, 2))
+        end = _timestamp(_field(period, 3, 2)) or _timestamp(_field(config, 5, 2))
+        seconds = end - start if start and end and end > start else None
+        used = struct.unpack("<f", used_bytes)[0]
+        return {"windows": [window(_period_name(seconds), used, end, seconds=seconds)]}
+    return None
+
+
+def grok_text_windows(text: str, now: float):
+    """The rendered usage view: "Weekly SuperGrok Plus Limit", "Resets <date> at <time>", "100%"."""
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    for index, line in enumerate(lines):
+        heading = _GROK_LIMIT.match(line)
+        if not heading:
+            continue
+        used = resets = None
+        for follow in lines[index + 1:index + 8]:
+            match = _GROK_RESETS.match(follow)
+            if match and resets is None:
+                try:
+                    resets = time.mktime(time.strptime(f"{match.group(1)} {match.group(2).upper()}",
+                                                       "%B %d, %Y %I:%M %p"))
+                except ValueError:
+                    pass
+            percent = _PERCENT_LINE.match(follow)
+            if percent and used is None:
+                used = float(percent.group(1))
+        if used is not None:
+            name = heading.group(1).lower()
+            return {"windows": [window(name, used, resets)], "plan": heading.group(2) or None}
+    return None
+
+
 EXTRACTORS = {CODEX_ID: codex_windows, COMPANION_ID: companion_windows, GROK_ID: grok_windows, QWEN_ID: qwen_windows}
 
 
@@ -187,11 +319,22 @@ def _signed_out(page: dict) -> bool:
 def extract(provider: str, page: dict, now: float | None = None) -> dict:
     now = time.time() if now is None else now
     for response in reversed(page.get("responses") or []):
+        if (provider == GROK_ID and response.get("raw")
+                and urlsplit(response.get("url") or "").path.endswith(GROK_CREDITS_METHOD)):
+            found = grok_grpc_windows(response["raw"], now)
+            if found:
+                parts = urlsplit(response["url"])
+                plan = (grok_text_windows(page.get("text") or "", now) or {}).get("plan")
+                return {"status": "ok", **found, "plan": plan, "evidence": f"{parts.netloc}{parts.path}"}
         for candidate in _objects(response.get("body")):
             found = EXTRACTORS[provider](candidate, now)
             if found and found["windows"]:
                 parts = urlsplit(response.get("url") or "")
                 return {"status": "ok", **found, "evidence": f"{parts.netloc}{parts.path}"}
+    if provider == GROK_ID:
+        found = grok_text_windows(page.get("text") or "", now)
+        if found:
+            return {"status": "ok", **found, "evidence": "page text"}
     final = urlsplit(page.get("final_url") or "")
     requested = urlsplit(page.get("url") or "")
     if _CHALLENGE.search(f"{page.get('title') or ''}\n{(page.get('text') or '')[:400]}"):
@@ -253,7 +396,36 @@ def debug_outline(page: dict) -> dict:
     final = urlsplit(page.get("final_url") or "")
     return {"final_url": f"{final.netloc}{final.path}", "title": page.get("title"),
             "responses": [{"url": "".join(urlsplit(r.get("url") or "")[1:3]), "status": r.get("status"),
-                           "keys": outline(r.get("body"))} for r in page.get("responses") or []]}
+                           "keys": outline(r.get("body")) if not r.get("raw") else _proto_outline(r["raw"])}
+                          for r in page.get("responses") or []]}
+
+
+def _proto_outline(raw: str) -> dict:
+    """Field paths of a gRPC-web body with numbers kept; bytes that aren't messages show only their length."""
+    out = {}
+
+    def walk(fields, path):
+        for number, wire, value in fields:
+            key = f"{path}.{number}" if path else str(number)
+            if wire == 2:
+                inner = _message(value) if value else None
+                if inner is not None:
+                    walk(inner, key)
+                else:
+                    out[key] = f"<bytes {len(value)}>"
+            elif wire == 5:
+                out[key] = round(struct.unpack("<f", value)[0], 4)
+            elif wire == 1:
+                out[key] = struct.unpack("<d", value)[0]
+            else:
+                out[key] = value
+
+    try:
+        for index, payload in enumerate(grpc_web_messages(base64.b64decode(raw, validate=True))):
+            walk(_message(payload) or [], f"frame{index}")
+    except ValueError:
+        out["error"] = "undecodable"
+    return out
 
 
 def write_private(path: Path, value) -> Path:
@@ -296,14 +468,23 @@ def _paint(text, code, color):
     return f"\x1b[{code}m{text}\x1b[0m" if color else text
 
 
+def _label(item: dict) -> str:
+    label = str(item.get("label") or item.get("name") or "")
+    return label.replace("five_hour", "5 hour").replace("_", " ")
+
+
 def format_report(report: dict, *, now: float | None = None, color: bool = False, width: int = 12) -> str:
     now = time.time() if now is None else now
-    lines = [f"{'AGENT':<8} {'WINDOW':<18} {'USED':<{width + 6}} RESETS"]
+    shown = [p for p in LIMIT_PROVIDERS if p in report.get("providers", {})]
+    labels = [_label(w) for p in shown for w in report["providers"][p].get("windows") or []]
+    column = min(40, max([len(label) for label in labels] + [len("WINDOW"), len("login_required")]))
+    lines = [f"{'AGENT':<8} {'WINDOW':<{column}} {'USED':<{width + 6}} RESETS"]
     worst = 0.0
-    for provider in [p for p in LIMIT_PROVIDERS if p in report.get("providers", {})]:
+    for provider in shown:
         entry = report["providers"][provider]
         if entry.get("status") != "ok":
-            lines.append(f"{provider:<8} {_paint(entry.get('status', 'error'), '33', color):<18} {entry.get('reason', '')}")
+            status = entry.get("status", "error")
+            lines.append(f"{provider:<8} {_paint(status, '33', color)}{' ' * (column - len(status))} {entry.get('reason', '')}")
             continue
         for item in entry.get("windows") or []:
             used = item.get("used_percent")
@@ -316,11 +497,10 @@ def format_report(report: dict, *, now: float | None = None, color: bool = False
             if resets:
                 stamp = time.strftime("%a %H:%M" if resets - now < 6 * 86400 else "%b %d %H:%M", time.localtime(resets))
                 when = "now" if resets <= now else f"in {_until(resets - now)} ({stamp})"
-            label = str(item.get("label") or item.get("name")).replace("_", " ")
-            lines.append(f"{provider:<8} {label[:18]:<18} {bar} {used:>5.1f}% {when}")
+            lines.append(f"{provider:<8} {_label(item)[:column]:<{column}} {bar} {used:>5.1f}% {when}")
         age = now - entry.get("checked_at", now)
         if age > 3600:
-            lines.append(f"{'':<8} {'':<18} read {_until(age)} ago")
+            lines.append(f"{'':<8} {'':<{column}} read {_until(age)} ago")
     return "\n".join(lines)
 
 

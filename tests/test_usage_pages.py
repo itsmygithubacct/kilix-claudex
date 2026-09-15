@@ -1,10 +1,13 @@
+import base64
 from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 import os
 from pathlib import Path
 import stat
+import struct
 import sys
+import time
 import tempfile
 import textwrap
 import unittest
@@ -37,6 +40,36 @@ GROK_BODY = {"data": {"config": {"creditUsagePercent": 64.0, "currentPeriod": {
 QWEN_BODY = {"code": "200", "successResponse": True, "data": {"Data": json.dumps({"DataV2": {"data": {"data": {
     "per5HourPercentage": 0.25, "per5HourResetTime": int((NOW + 7200) * 1000),
     "per1WeekPercentage": 64, "per1WeekResetTime": "2026-09-21T16:00:00Z"}}}})}}
+
+
+def pb_varint(number):
+    out = b""
+    while True:
+        byte, number = number & 0x7F, number >> 7
+        out += bytes([byte | 0x80 if number else byte])
+        if not number:
+            return out
+
+
+def pb(number, wire, value):
+    key = pb_varint(number << 3 | wire)
+    if wire == 0:
+        return key + pb_varint(value)
+    if wire == 5:
+        return key + struct.pack("<f", value)
+    return key + pb_varint(len(value)) + value
+
+
+def grok_credits(used, start, end):
+    # The GetGrokCreditsConfig layout decoded from grok.com for a signed-in account.
+    stamp = lambda seconds: pb(1, 0, int(seconds)) + pb(2, 0, 422174000)
+    config = (pb(1, 5, used) + pb(2, 2, b"") + pb(4, 2, stamp(start)) + pb(5, 2, stamp(end))
+              + pb(7, 2, pb(1, 0, 2) + pb(2, 5, used))
+              + pb(8, 2, pb(1, 0, 2) + pb(2, 2, stamp(start)) + pb(3, 2, stamp(end)))
+              + pb(11, 0, 1) + pb(12, 2, pb(1, 0, 103)) + pb(13, 0, 1))
+    message, trailer = pb(1, 2, config), b"grpc-status:0\r\n"
+    frames = b"\x00" + struct.pack(">I", len(message)) + message + b"\x80" + struct.pack(">I", len(trailer)) + trailer
+    return base64.b64encode(frames).decode()
 
 
 def page(body=None, url="https://example.com/settings/usage", final=None, title="Usage", text="", source=None):
@@ -92,6 +125,39 @@ class ExtractorTests(unittest.TestCase):
                          "login_required")
         self.assertEqual(extract(providers.QWEN_ID, page(text="Log in to QwenCloud You are currently not logged in."))["status"],
                          "login_required")
+
+
+class GrokPageTests(unittest.TestCase):
+    CREDITS_URL = "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig"
+
+    def test_the_credits_protobuf_gives_the_weekly_period(self):
+        view = page(url="https://grok.com/?_s=usage", text="Weekly SuperGrok Plus Limit\nused\n100%\n")
+        view["responses"].append({"url": self.CREDITS_URL, "status": 200, "body": None,
+                                  "raw": grok_credits(64.25, NOW - 3 * 86400, NOW + 4 * 86400)})
+        result = usage_pages.extract(providers.GROK_ID, view, now=NOW)
+        weekly = result["windows"][0]
+        self.assertEqual((result["status"], result["plan"], result["evidence"]),
+                         ("ok", "SuperGrok Plus", "grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig"))
+        self.assertEqual((weekly["name"], weekly["used_percent"], weekly["window_seconds"]), ("weekly", 64.2, 7 * 86400))
+        self.assertAlmostEqual(weekly["resets_at"], NOW + 4 * 86400 + 0.422174, places=3)
+        monthly = usage_pages.grok_grpc_windows(grok_credits(10, NOW, NOW + 30 * 86400), NOW)
+        self.assertEqual(monthly["windows"][0]["name"], "monthly")
+        self.assertIsNone(usage_pages.grok_grpc_windows(base64.b64encode(b"\x00\x00\x00\x00\x02\xff\xff").decode(), NOW))
+
+    def test_the_rendered_view_is_the_fallback(self):
+        text = ("Buy Credits\nWeekly SuperGrok Plus Limit\nused\nResets September 16, 2026 at 5:11 PM\n"
+                "Grok Build\n100%\nExtra Usage Credits\n")
+        result = usage_pages.extract(providers.GROK_ID, page(url="https://grok.com/?_s=usage", text=text), now=NOW)
+        weekly = result["windows"][0]
+        self.assertEqual((result["status"], result["evidence"], weekly["used_percent"]), ("ok", "page text", 100.0))
+        self.assertEqual(weekly["resets_at"], time.mktime(time.strptime("September 16, 2026 5:11 PM", "%B %d, %Y %I:%M %p")))
+
+    def test_debug_outline_shows_protobuf_field_paths(self):
+        view = page()
+        view["responses"] = [{"url": self.CREDITS_URL, "status": 200, "body": None,
+                              "raw": grok_credits(100.0, NOW, NOW + 7 * 86400)}]
+        keys = usage_pages.debug_outline(view)["responses"][0]["keys"]
+        self.assertEqual((keys["frame0.1.1"], keys["frame0.1.8.1"], keys["frame0.1.12.1"]), (100.0, 2, 103))
 
 
 class ReportTests(unittest.TestCase):

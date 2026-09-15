@@ -208,12 +208,14 @@ class ChromePipe:
                         last_activity = time.monotonic()
                         response = params.get("response") or {}
                         host = urlsplit(response.get("url", "")).hostname or ""
-                        if "json" in str(response.get("mimeType")) and _in_domains(host, domains):
-                            pending[params.get("requestId")] = {"url": response.get("url"), "status": response.get("status")}
+                        mime = str(response.get("mimeType"))
+                        if ("json" in mime or "grpc-web" in mime) and _in_domains(host, domains):
+                            pending[params.get("requestId")] = {"url": response.get("url"), "status": response.get("status"),
+                                                                "mime": mime}
                     elif method == "Network.loadingFinished" and params.get("requestId") in pending:
                         last_activity = time.monotonic()
                         entry = pending.pop(params["requestId"])
-                        entry["body"] = self._body(params["requestId"], session, params.get("encodedDataLength"))
+                        entry.update(self._body(params["requestId"], session, params.get("encodedDataLength")))
                         page["responses"].append(entry)
                 if done and page["responses"] and done(page):
                     break
@@ -233,19 +235,20 @@ class ChromePipe:
             except BrowserError:
                 pass
 
-    def _body(self, request_id, session, size):
+    def _body(self, request_id, session, size) -> dict:
+        """``{"body": parsed JSON}``, or ``{"raw": base64}`` for a binary body such as gRPC-web."""
         if isinstance(size, (int, float)) and size > BODY_LIMIT:
-            return None
+            return {"body": None}
         try:
             result = self.call("Network.getResponseBody", {"requestId": request_id}, session=session, timeout=10)
         except BrowserError:
-            return None
+            return {"body": None}
         if result.get("base64Encoded"):
-            return None
+            return {"body": None, "raw": result.get("body") or ""}
         try:
-            return json.loads(result.get("body") or "")
+            return {"body": json.loads(result.get("body") or "")}
         except ValueError:
-            return None
+            return {"body": None}
 
 
 def _in_domains(host: str, domains) -> bool:
