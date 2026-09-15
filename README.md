@@ -271,6 +271,43 @@ stopped. Periodic prompts can wake an agent even when nothing changed; pause
 the timer when periodic work is no longer needed. The example prompt ends in a
 newline and therefore uses a snapshot file.
 
+## Team tab
+
+`claudex_team.py` opens the five-pane team tab and checks on it later.
+
+```sh
+./claudex_team.py plan                  # which agent each pane would run, with the token checks
+./claudex_team.py launch                # open the claudex-team tab
+./claudex_team.py launch --dry-run      # print the kilix commands instead
+./claudex_team.py launch --placeholder  # the same layout with shells, titled test-*
+./claudex_team.py status                # find the panes; check layout, commands and tokens
+```
+
+The tab uses kilix's splits layout. The orchestrator and companion are the two
+full-height columns of the left half. The right half is `claudex_worker_1`
+beside a column that stacks `claudex_worker_2` over `claudex_worker_3`.
+
+| Pane | Runs |
+| --- | --- |
+| `claudex-orchestrator` | `codex --yolo -m gpt-6-astra -c model_reasoning_effort=max` |
+| `claudex-companion` | the companion CLI on the model named in `providers.py`, with permissions skipped |
+| `claudex_worker_1` | `grok --yolo` while grok has tokens, else `~/qwen-test/omp-qwen --here max -- --approval-mode=yolo` |
+| `claudex_worker_2` | the `~/qwen-test` companion-CLI launcher with `--here max`, with permissions skipped |
+| `claudex_worker_3` | `codex --yolo -m gpt-5.3-codex-spark` while Spark has tokens, else the omp Qwen fallback |
+
+- **Tokens:** the newest current evidence decides. Sources are the
+  `claudex usage` reading (read again first when older than 15 minutes;
+  `--no-refresh` skips that and `--refresh` forces it), grok's billing log, and
+  Codex rollouts for the Spark bucket (`codex_bengalfox`). A window at 100% that
+  hasn't reset means no tokens. When nothing is known, the primary agent runs.
+- **Panes:** each pane holds at a shell when its agent exits. The caller's
+  `PATH` is passed so kilix finds the CLIs, and the Qwen launchers read their
+  API key inside the pane. `CLAUDEX_QWEN_DIR` replaces `~/qwen-test`.
+- **Duplicates:** `launch` refuses while a pane with a team title exists,
+  because claudex finds panes by title. `--allow-duplicates` overrides.
+- **Status:** exits 0 when each of the five panes exists once, in one tab, with
+  the team layout; otherwise 2.
+
 ## Runtime state
 
 All runtime files live in `.loop/` beside the resolved configuration file:
