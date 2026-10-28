@@ -839,7 +839,7 @@ def parser():
     usage.add_argument("--timeout", type=float, default=45.0, metavar="SECONDS", help="per page (default 45)")
     usage.add_argument("--debug", action="store_true", help="write a redacted outline of each page's JSON keys")
     route_cmd = commands.add_parser(
-        "route", help="open a named route: max, worker low|mid|high|max, security, grammar, shell, or needle")
+        "route", help="open a named route: max, worker low|mid|high|max, or security")
     route_cmd.add_argument("name", choices=route.ROUTE_NAMES)
     route_cmd.add_argument(
         "request", nargs="*", metavar="REQUEST",

@@ -17,12 +17,8 @@ signed-out, or failed reading is not treated as zero.
 
 ``worker`` opens both sides of a tier and does not read usage.
 ``security`` opens one session: Grok, else opus 5.5 high, else gpt-6-astra high.
-``grammar``, ``needle``, and ``shell`` each open one session and do not read
-usage. ``grammar`` runs ``kilix-needle system --baseline`` (explicit grammar
-only). ``needle`` runs the ``kilix-needle`` prompt: the grammar reads an exact
-request, and the model is the fallback. ``shell`` opens bash for find, ps, df,
-and rg. Kilix verbs such as ls, focus, new-pane, and watch are the ``kilix``
-commands themselves.
+Use ``kilix grammar``, ``kilix needle``, and ``kilix shell`` for tools in
+the caller's pane.
 
 A request may follow the route::
 
@@ -51,17 +47,8 @@ from providers import CODEX_ID, COMPANION_COMMAND, COMPANION_ID, COMPANION_SKIP_
 import usage_pages
 
 USAGE_TTL = 30 * 60
-ROUTE_NAMES = ("max", "worker", "security", "grammar", "shell", "needle")
+ROUTE_NAMES = ("max", "worker", "security")
 WORKER_TIERS = ("low", "mid", "high", "max")
-# One pane, no usage reading. Kilix verbs stay the kilix commands; they are not a pane here.
-TOOL_ROUTES = {
-    "grammar": {"agent": "kilix-needle", "argv": ("kilix-needle", "system", "--baseline"),
-                "title": "claudex-route-grammar", "reason": "deterministic grammar"},
-    "needle": {"agent": "kilix-needle", "argv": ("kilix-needle",),
-               "title": "claudex-route-needle", "reason": "needle prompt"},
-    "shell": {"agent": "bash", "argv": ("bash",),
-              "title": "claudex-route-shell", "reason": "plain shell"},
-}
 ACCOUNT_WINDOWS = ("five_hour", "weekly")
 _LABEL = {"five_hour": "5h", "weekly": "weekly"}
 
@@ -296,16 +283,6 @@ def choose_security(usage: dict, *, now: float) -> dict:
             "sessions": [_session(CODEX_ID, ASTRA, "high", title="claudex-route-security")]}
 
 
-def _tool_session(agent: str, argv, *, title: str) -> dict:
-    return {"agent": agent, "model": None, "effort": None, "argv": list(argv), "title": title}
-
-
-def choose_tool(name: str) -> dict:
-    spec = TOOL_ROUTES[name]
-    return {"reason": spec["reason"], "skipped": [],
-            "sessions": [_tool_session(spec["agent"], spec["argv"], title=spec["title"])]}
-
-
 def choose_worker(tier: str) -> dict:
     if tier not in WORKERS:
         raise RouteError(f"claudex route worker needs {', '.join(WORKER_TIERS)}")
@@ -464,8 +441,6 @@ def run(name: str, tier: str | None = None, *, cache: Path, cwd: Path, now: floa
     consulted: list = []
     if name == "worker":
         decision = choose_worker(tier)
-    elif name in TOOL_ROUTES:
-        decision = choose_tool(name)
     elif name == "max":
         consulted = [CODEX_ID, COMPANION_ID]
         usage, refreshed = ensure_usage(consulted, cache, now=now, readers=readers)

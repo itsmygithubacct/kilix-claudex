@@ -281,9 +281,6 @@ claudex route worker mid
 claudex route worker high
 claudex route worker max
 claudex route security             # one session, along a fallback chain
-claudex route grammar              # kilix-needle system --baseline
-claudex route needle               # kilix-needle prompt
-claudex route shell                # bash
 claudex route max --dry-run        # print the model; open nothing
 claudex route max "fix src/app.py" --dry-run
 claudex route max --json           # the choice, the reason, and the numbers used
@@ -323,15 +320,6 @@ Security opens one pane: `grok --yolo` while Grok has tokens, otherwise
 opus 5.5 at high effort, otherwise `gpt-6-astra` at high effort. Out of
 tokens means the five-hour or weekly window is fully used and has not reset.
 A signed-out agent is skipped.
-
-Grammar, needle, and shell each open one pane and do not check usage.
-They do not take a tier.
-
-| route | command | what the pane is for |
-| --- | --- | --- |
-| grammar | `kilix-needle system --baseline` | explicit grammar only; no model fallback |
-| needle | `kilix-needle` | grammar reads an exact request; the model is the fallback |
-| shell | `bash` | find, ps, df, rg |
 
 Kilix verbs such as `ls`, `focus`, `new-pane`, and `watch` are `kilix`
 commands. Route does not open a pane for them.

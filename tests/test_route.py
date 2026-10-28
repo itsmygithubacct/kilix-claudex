@@ -260,7 +260,7 @@ class GrokMenuTests(unittest.TestCase):
         self.assertEqual(route.grok_target(home=home), ("grok-9", "max"))
 
 
-class ToolRouteTests(unittest.TestCase):
+class RouteBoundaryTests(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
         self.cache = Path(self.folder.name) / "usage-pages.json"
@@ -277,35 +277,16 @@ class ToolRouteTests(unittest.TestCase):
             return inner
         return {CODEX_ID: read(CODEX_ID), COMPANION_ID: read(COMPANION_ID), GROK_ID: read(GROK_ID)}
 
-    def test_each_tool_route_skips_usage_and_names_its_command(self):
-        expected = {
-            "grammar": (["kilix-needle", "system", "--baseline"], "deterministic grammar",
-                        "claudex-route-grammar", "kilix-needle"),
-            "needle": (["kilix-needle"], "needle prompt", "claudex-route-needle", "kilix-needle"),
-            "shell": (["bash"], "plain shell", "claudex-route-shell", "bash"),
-        }
-        for name, (argv, reason, title, agent) in expected.items():
-            with self.subTest(name):
-                self.calls.clear()
+    def test_kilix_tools_are_rejected_before_usage_or_launch(self):
+        for name in ("grammar", "needle", "shell"):
+            with self.subTest(name=name):
                 launch = Launch()
-                decision = route.run(name, cache=self.cache, cwd=Path(self.folder.name), now=NOW,
-                                     readers=self.readers(), launch=launch, dry_run=True)
+                with self.assertRaises(route.RouteError):
+                    route.run(name, cache=self.cache, cwd=Path(self.folder.name), now=NOW,
+                              readers=self.readers(), launch=launch)
                 self.assertEqual(self.calls, [])
                 self.assertEqual(launch.calls, [])
-                session = decision["sessions"][0]
-                self.assertEqual(session["argv"], argv)
-                self.assertEqual(session["title"], title)
-                self.assertEqual(session["agent"], agent)
-                self.assertIsNone(session["model"])
-                self.assertIsNone(session["effort"])
-                self.assertEqual(decision["reason"], reason)
-                self.assertEqual(decision["refreshed"], [])
-                self.assertTrue(route.format_line(decision).startswith(f"would open {name} {agent}"))
-                record = route.public_record(decision)
-                self.assertEqual(record["sessions"][0]["argv"], argv)
-                with self.assertRaises(route.RouteError):
-                    route.run(name, "low", cache=self.cache, cwd=Path(self.folder.name), now=NOW,
-                              readers=self.readers(), dry_run=True)
+                self.assertFalse(self.cache.exists())
 
     def test_verb_is_not_a_route(self):
         self.assertNotIn("verb", route.ROUTE_NAMES)
@@ -313,18 +294,6 @@ class ToolRouteTests(unittest.TestCase):
             route.run("verb", cache=self.cache, cwd=Path(self.folder.name), now=NOW,
                       readers=self.readers(), dry_run=True)
 
-    def test_grammar_launch_forwards_the_needle_command(self):
-        launch = Launch()
-        decision = route.run("grammar", cache=self.cache, cwd=Path(self.folder.name), now=NOW,
-                             readers=self.readers(), launch=launch)
-        self.assertEqual(self.calls, [])
-        self.assertEqual(decision["window_ids"], [401])
-        args = launch.calls[0]
-        self.assertEqual(args[:4], ("grid", "add", "--name", "claudex-route"))
-        self.assertIn("--new", args)
-        self.assertEqual(args[args.index("--title") + 1], "claudex-route-grammar")
-        self.assertNotIn("--no-hold", args)
-        self.assertEqual(args[args.index("--") + 1:], ("kilix-needle", "system", "--baseline"))
 
 
 class RequestTests(unittest.TestCase):
@@ -434,9 +403,9 @@ class CommandTests(unittest.TestCase):
         with self.assertRaises(LoopError):
             route_command(Namespace(name="worker", tier=None, dry_run=True, json=False, cwd=None), Path("."))
 
-    def test_the_cli_rejects_a_tier_on_a_tool_route(self):
+    def test_the_cli_rejects_a_tier_on_security(self):
         from pane_loop import LoopError, route_command
         from argparse import Namespace
 
         with self.assertRaises(LoopError):
-            route_command(Namespace(name="grammar", tier="low", dry_run=True, json=False, cwd=None), Path("."))
+            route_command(Namespace(name="security", tier="low", dry_run=True, json=False, cwd=None), Path("."))
