@@ -281,11 +281,14 @@ newline and therefore uses a snapshot file.
 ./claudex_team.py launch --dry-run      # print the kilix commands instead
 ./claudex_team.py launch --placeholder  # the same layout with shells, titled test-*
 ./claudex_team.py status                # find the panes; check layout, commands and tokens
+./claudex_team.py status --placeholder  # the same check for the test-* panes
 ```
 
-The tab uses kilix's splits layout. The orchestrator and companion are the two
-full-height columns of the left half. The right half is `claudex_worker_1`
-beside a column that stacks `claudex_worker_2` over `claudex_worker_3`.
+The tab is a kilix session grid named `claudex-team`, opened with
+`kilix session grid add` (it needs a kilix with session grids). The grid has
+two rows and fills them column by column in launch order: the orchestrator over
+the companion, `claudex_worker_1` over `claudex_worker_2`, then
+`claudex_worker_3` full height on the right.
 
 | Pane | Runs |
 | --- | --- |
@@ -305,8 +308,8 @@ beside a column that stacks `claudex_worker_2` over `claudex_worker_3`.
   API key inside the pane. `CLAUDEX_QWEN_DIR` replaces `~/qwen-test`.
 - **Duplicates:** `launch` refuses while a pane with a team title exists,
   because claudex finds panes by title. `--allow-duplicates` overrides.
-- **Status:** exits 0 when each of the five panes exists once, in one tab, with
-  the team layout; otherwise 2.
+- **Status:** exits 0 when each of the five panes exists once, in one tab in
+  the `sessions` layout, in launch order; otherwise 2. Panes are found by title.
 
 ## Runtime state
 
