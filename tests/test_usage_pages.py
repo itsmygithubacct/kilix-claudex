@@ -14,6 +14,9 @@ import unittest
 from unittest.mock import patch
 
 import browser
+import claude_status
+import codex_status
+import grok_status
 import pane_loop as loop
 import providers
 import usage_pages
@@ -166,13 +169,47 @@ class ReportTests(unittest.TestCase):
             providers.CODEX_ID: {"status": "ok", "checked_at": NOW, **usage_pages.codex_windows(CODEX_BODY, NOW)},
             providers.GROK_ID: {"status": "login_required", "reason": "not signed in", "checked_at": NOW}}}
 
-    def test_table_shows_bars_percentages_resets_and_statuses(self):
+    def test_table_shows_remaining_unless_used_is_requested(self):
         text = usage_pages.format_report(self.report(), now=NOW)
-        self.assertIn("42.0% in 1h 0m", text)
-        self.assertIn("█████░░░░░░░", text)
+        self.assertIn("REMAINING", text)
+        self.assertIn("58.0% in 1h 0m", text)
+        self.assertIn("███████░░░░░", text)
+        self.assertNotIn("42.0%", text)
         self.assertIn("login_required", text)
         self.assertNotIn("\x1b[", text)
         self.assertIn("\x1b[32m", usage_pages.format_report(self.report(), now=NOW, color=True))
+        used = usage_pages.format_report(self.report(), now=NOW, basis="used")
+        self.assertIn("USED", used)
+        self.assertIn("42.0% in 1h 0m", used)
+        self.assertIn("█████░░░░░░░", used)
+
+    def test_summary_is_one_line_of_5h_and_weekly_remaining(self):
+        report = {"providers": {
+            providers.CODEX_ID: {"status": "ok", "windows": [
+                usage_pages.window("five_hour", 20), usage_pages.window("weekly", 45),
+                usage_pages.window("spark_five_hour", 5)]},
+            providers.COMPANION_ID: {"status": "ok", "windows": [
+                usage_pages.window("five_hour", 100), usage_pages.window("weekly", 68),
+                usage_pages.window("weekly_fable", 0)]},
+            providers.GROK_ID: {"status": "ok", "windows": [
+                usage_pages.window("weekly", 45), usage_pages.window("weekly_build", 60)]},
+            providers.QWEN_ID: {"status": "ok", "windows": [
+                usage_pages.window("five_hour", 25), usage_pages.window("weekly", 64)]}}}
+        self.assertEqual(
+            usage_pages.format_summary(report),
+            "codex 5h 80 weekly 55; claude 5h 0 weekly 32; grok weekly 55; qwen 5h 75 weekly 36")
+        self.assertEqual(
+            usage_pages.summary_record(report, basis="used"),
+            {"codex": {"5h": 20, "weekly": 45}, "claude": {"5h": 100, "weekly": 68},
+             "grok": {"weekly": 45}, "qwen": {"5h": 25, "weekly": 64}})
+
+    def test_the_status_screen_is_printed_only_when_verbose(self):
+        report = self.report()
+        report["providers"][providers.CODEX_ID]["screen"] = "Weekly limit 55% left\n"
+        self.assertNotIn("/status", usage_pages.format_report(report, now=NOW))
+        shown = usage_pages.format_report(report, now=NOW, verbose=True)
+        self.assertIn("codex /status", shown)
+        self.assertIn("Weekly limit 55% left", shown)
 
     def test_exhaustion_and_cache_merging_keep_earlier_readings_private(self):
         self.assertFalse(usage_pages.exhausted(self.report()))
@@ -280,26 +317,88 @@ class CommandTests(unittest.TestCase):
             status = loop.main(["--config", str(self.config), "usage", *argv])
         return status, output.getvalue()
 
-    def test_read_prints_json_caches_it_and_show_filters_the_cache(self):
-        report = {"read_at": NOW, "display": "virtual", "providers": {
-            providers.COMPANION_ID: {"status": "ok", "checked_at": NOW, **usage_pages.companion_windows(COMPANION_BODY, NOW)},
-            providers.GROK_ID: {"status": "login_required", "reason": "not signed in", "checked_at": NOW}}}
-        with patch.object(usage_pages, "read_usage", return_value=report) as read:
-            status, output = self.run_main(providers.COMPANION_ID, providers.GROK_ID, "--json", "--display", "headless")
-        self.assertEqual(status, 2)  # the weekly window is at 100%
-        self.assertEqual(read.call_args.args[0], [providers.COMPANION_ID, providers.GROK_ID])
-        self.assertEqual(read.call_args.kwargs["display"], "headless")
-        self.assertEqual(json.loads(output)["providers"][providers.GROK_ID]["status"], "login_required")
+    def test_read_prints_a_short_line_and_full_json_keeps_the_detail(self):
+        report = {"read_at": NOW, "display": "virtual", "providers": {}}
+        claude = {"status": "ok", "checked_at": NOW, "screen": "secret screen",
+                  "windows": [usage_pages.window("five_hour", 100.0), usage_pages.window("weekly_fable", 0)]}
+        grok = {"status": "login_required", "reason": "not signed in", "checked_at": NOW, "windows": []}
+        with patch.object(usage_pages, "read_usage", return_value=report) as read, \
+                patch.object(claude_status, "read", return_value=claude), \
+                patch.object(grok_status, "read", return_value=grok) as grok_read:
+            status, output = self.run_main(providers.COMPANION_ID, providers.GROK_ID, "--display", "headless")
+        self.assertEqual(status, 2)  # the session window has nothing remaining
+        read.assert_not_called()
+        grok_read.assert_called_once()
+        self.assertEqual(output.strip(), "claude 5h 0")
+        status, verbose_line = self.run_main("show", providers.COMPANION_ID, providers.GROK_ID, "--verbose")
+        self.assertEqual(verbose_line.strip(), "claude 5h 0; grok login_required")
+        cached = json.loads((self.config.parent / ".loop" / "usage-pages.json").read_text())
+        self.assertEqual(cached["providers"][providers.COMPANION_ID]["screen"], "secret screen")
         status, output = self.run_main("show", providers.GROK_ID)
         self.assertEqual(status, 1)  # nothing readable among the shown agents
-        self.assertIn("login_required", output)
-        self.assertNotIn("weekly", output)
+        self.assertEqual(output.strip(), "")
+        status, output = self.run_main("show", providers.GROK_ID, "--verbose")
+        self.assertEqual(output.strip(), "grok login_required")
+        status, full = self.run_main("show", providers.COMPANION_ID, providers.GROK_ID, "--full")
+        loaded = json.loads(full)
+        self.assertEqual(loaded["providers"][providers.GROK_ID]["status"], "login_required")
+        self.assertNotIn("screen", loaded["providers"][providers.COMPANION_ID])
+        self.assertEqual(loaded["providers"][providers.COMPANION_ID]["windows"][0]["remaining_percent"], 0.0)
+        status, human = self.run_main("show", providers.COMPANION_ID, "--human")
+        self.assertEqual(status, 2)
+        self.assertIn("REMAINING", human)
+        self.assertIn("0.0%", human)
+        self.assertNotIn("weekly", human)
+        self.assertNotIn("secret screen", human)
+        status, used = self.run_main("show", providers.COMPANION_ID, "--human", "--used")
+        self.assertIn("USED", used)
+        self.assertIn("100.0%", used)
+        status, verbose = self.run_main("show", providers.COMPANION_ID, "--full", "--verbose")
+        self.assertEqual(json.loads(verbose)["providers"][providers.COMPANION_ID]["screen"], "secret screen")
+        status, compact = self.run_main("show", providers.COMPANION_ID, "--json")
+        self.assertEqual(json.loads(compact), {"claude": {"5h": 0}})
+
+    def test_codex_and_claude_come_from_tmux_and_grok_still_uses_pages(self):
+        qwen = {"read_at": NOW, "display": "virtual", "providers": {
+            providers.QWEN_ID: {"status": "ok", "checked_at": NOW, "windows": [usage_pages.window("weekly", 64.0)]}}}
+        codex = {"status": "ok", "checked_at": NOW, "screen": "Weekly limit 55% left",
+                 "windows": [usage_pages.window("weekly", 45.0)]}
+        claude = {"status": "ok", "checked_at": NOW, "screen": "Current session",
+                  "windows": [usage_pages.window("five_hour", 17.0)]}
+        grok = {"status": "ok", "checked_at": NOW, "source": grok_status.SOURCE,
+                "windows": [usage_pages.window("weekly", 10.0)]}
+        with patch.object(usage_pages, "read_usage", return_value=qwen) as read, \
+                patch.object(codex_status, "read", return_value=codex) as codex_read, \
+                patch.object(claude_status, "read", return_value=claude) as claude_read, \
+                patch.object(grok_status, "read", return_value=grok) as grok_read:
+            status, output = self.run_main(providers.GROK_ID, providers.COMPANION_ID, providers.CODEX_ID,
+                                           providers.QWEN_ID)
+        self.assertEqual(status, 0)
+        self.assertEqual(read.call_args.args[0], [providers.QWEN_ID])
+        codex_read.assert_called_once()
+        claude_read.assert_called_once()
+        grok_read.assert_called_once()
+        self.assertEqual(output.strip(), "codex weekly 55; claude 5h 83; grok weekly 90; qwen weekly 36")
+        status, full = self.run_main("show", "--full")
+        loaded = json.loads(full)
+        self.assertNotIn("screen", loaded["providers"][providers.CODEX_ID])
+        self.assertEqual(loaded["providers"][providers.CODEX_ID]["windows"][0]["remaining_percent"], 55.0)
+        with patch.object(usage_pages, "read_usage") as read, \
+                patch.object(codex_status, "read", return_value=codex), \
+                patch.object(claude_status, "read", return_value=claude):
+            self.run_main(providers.CODEX_ID, providers.COMPANION_ID)
+        read.assert_not_called()
 
     def test_login_opens_the_requested_pages_and_bad_agents_are_errors(self):
         with patch.object(browser, "launch_login", return_value=4321) as launch:
             status, output = self.run_main("login", providers.QWEN_ID, "--json")
         self.assertEqual((status, json.loads(output)["pid"]), (0, 4321))
         self.assertEqual(launch.call_args.args[1], [providers.USAGE_PAGES[providers.QWEN_ID]])
+        with patch.object(browser, "launch_login") as launch:
+            status, output = self.run_main("login", providers.CODEX_ID)
+        self.assertEqual(status, 0)
+        launch.assert_not_called()
+        self.assertIn("codex_usage", output)
         status, output = self.run_main("nonsense")
         self.assertEqual((status, json.loads(output)["status"]), (1, "error"))
         status, output = self.run_main("show")

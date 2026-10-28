@@ -197,40 +197,128 @@ skipped`, exit 2) before typing; `send --allow-limited` overrides this. The
 optional `min_remaining_percent` in `loop.json` also skips targets below that
 remaining percentage.
 
-### Reading the usage pages
+### Reading usage
 
-`claudex usage` reads each agent's official usage page in a dedicated Chrome
-profile and prints its percentages and reset times. Sign in once:
+Codex is read from a tmux session named `codex_usage`, and Claude from
+`claude_usage`, not from the websites. Grok is read from the grok CLI login
+(`grok login`), through the same billing request the CLI uses, not from the
+website. Qwen still comes from its official usage page. `claudex usage` checks `tb ls` for that
+exact session name and creates a missing one with `tb new`. `tb a <name>` is
+the interactive form of that create: it attaches afterwards, needs a TTY, and
+does not return, so the CLI leaves the session detached. Each agent is started
+there when the pane is still a shell. Codex is launched with startup
+self-update disabled, so a failed upgrade cannot exit before the TUI is up.
+`/status` is submitted twice for Codex, and only the screen after the second
+submission is kept. Claude is different: type `claude`, wait a couple of
+seconds, submit `/status`, then press Right twice to reach Usage. When that
+dialog is already open, the reading is refreshed with Left, then Right, and
+the screen is dumped a second later. Qwen still comes from its official
+usage page.
 
 ```sh
-claudex usage login                # open every usage page in the claudex browser profile
-claudex usage                      # read all four pages and print a report
-claudex usage codex grok           # read only these agents
-claudex usage show                 # the last reading, without opening a browser
+claudex usage login                # open the Qwen usage page; Grok signs in with `grok login`
+claudex usage                      # one line: remaining 5h and weekly for codex, claude, grok, qwen
+claudex usage codex claude         # those two sessions only, no browser
+claudex usage grok                 # the grok CLI billing request, no browser
+claudex usage show                 # the last reading, without opening a browser or tmux
 claudex usage status               # profile path, whether it's open, time of the last reading
-claudex usage --json
+claudex usage --json               # the same short reading as one JSON object
+claudex usage --full               # every window, reset time, and both percentages
+claudex usage --human              # table of the 5h and weekly rows
+claudex usage --human --used       # that table as used percent
+claudex usage --full --verbose     # full JSON plus the tmux /status screen
 ```
 
 - **Profile:** `usage-browser/` in the app data directory, mode 0700. It holds
-  your logins for these sites; claudex never reads its cookies. Delete the
-  directory to sign out everywhere. Close the login window before reading,
-  because Chrome can't open one profile twice.
+  your login for the Qwen site; claudex never reads its cookies. Grok uses
+  the `grok login` token in `$GROK_HOME/auth.json` and does not use this profile.
+  Delete the directory to sign out of that site. Close the login window
+  before reading, because Chrome can't open one profile twice. Codex signs in
+  inside `codex_usage`. Claude signs in inside `claude_usage`.
 - **Browser:** Chrome runs on a private Xvfb display by default.
   `--display screen` shows the window, and `--display headless` uses headless
   Chrome. claudex speaks to it over `--remote-debugging-pipe`, which opens no
   network port. Chrome marks such a session as automated, and claudex doesn't
   hide that; signing in happens in an ordinary window.
-- **Data:** numbers come from the JSON each page requests, not from its layout:
-  Codex `rate_limit` windows, the companion agent's `five_hour` and
-  `seven_day` utilization, Grok `creditUsagePercent` with `currentPeriod`, and
-  Qwen Token Plan `per5HourPercentage` and `per1WeekPercentage`.
+- **Data:** Codex numbers are parsed from the second `/status` screen. Claude
+  numbers are parsed from the Usage page: Current session is the five-hour
+  window, and Current week is the weekly window. Grok `creditUsagePercent`
+  and `currentPeriod` come from the CLI billing response. Qwen comes from the
+  JSON its page requests: `per5HourPercentage` and `per1WeekPercentage`.
 - **Statuses:** `login_required` (run `claudex usage login AGENT`),
   `challenge` (a bot check; retry with `--display screen` and complete it),
   `unparsed` (rerun with `--debug`, which writes an outline of each page's JSON
   keys to `.loop/usage-debug-AGENT.json`, keeping numbers and timestamps and
   redacting other text) or `error`.
-- **Output:** the latest reading per agent is kept in `.loop/usage-pages.json`.
-  Exit codes: 0 read, 2 a window is at 100%, 1 nothing could be read.
+- **Output:** the default is one line, so a model can read it without a
+  large prompt. It lists remaining 5-hour and weekly percent for Codex,
+  Claude, Grok, and Qwen, and leaves out model splits, reset times, and the
+  tmux screen. An agent that is not signed in is left off that line;
+  `--verbose` includes it. `--json` is that same line as one compact JSON object.
+  `--full` is the detailed JSON, with both `remaining_percent` and
+  `used_percent` on every window. `--human` prints a table of the short
+  windows; `--full --human` prints every window. `--used` reports consumed
+  percent, and `--remaining` is the default. The tmux screen is stored in
+  the cache and printed only with `--full --verbose` or `--human --verbose`.
+  The latest reading per agent is kept in `.loop/usage-pages.json`.
+  Exit codes: 0 read, 2 a window is fully used, 1 nothing could be read.
+
+## Routing
+
+`claudex route` opens panes from a named algorithm. When a route checks usage,
+each agent's numbers stay valid for 30 minutes: a provider whose `checked_at`
+is younger than that is not read again. Worker tiers do not check usage.
+The dashboard's 15-second cache is a separate timer.
+
+```sh
+claudex route max                  # one session
+claudex route worker low           # both workers
+claudex route worker mid
+claudex route worker high
+claudex route worker max
+claudex route security             # one session, along a fallback chain
+claudex route max --dry-run        # print the model; open nothing
+claudex route max "fix src/app.py" --dry-run
+claudex route max --json           # the choice, the reason, and the numbers used
+```
+
+`--dry-run` prints the model it would open and does not open a pane. A request
+after the route name is checked first. It parses when it names at least one
+file path and every path is an existing file. A path starts with `/`, `~/`,
+`./`, or `../`, or contains a slash. Quote a path that has spaces. Relative
+paths resolve from `--cwd`. The next line is `parse ok` and the files, or
+`parse fail` with `no file path`, `missing`, or `not a file`. A request that
+does not parse exits 1 and opens nothing. Codex, Claude, and Grok receive a
+parsed request as their initial prompt. `worker` takes the tier, then the
+request: `claudex route worker low "fix src/app.py"`.
+
+Max uses remaining percent and never chooses Qwen. A missing or signed-out
+reading is left unknown. The checks run in this order:
+
+1. Both weekly readings are known and each is under 20, and Grok still has
+   weekly remaining: Grok's latest model at max, or xhigh when that model's
+   menu has no max. grok-4.7's menu stops at xhigh.
+2. One weekly reading leads the other by 50 points or more: that agent, at
+   `gpt-6-astra` max or opus 5.5 max (`claude-opus-5-5`).
+3. Claude's 5-hour reading is over 50: opus 5.5 max.
+4. Otherwise `gpt-6-astra` max.
+
+Worker opens the Codex pane and the Claude pane together.
+
+| tier | Codex | Claude |
+| --- | --- | --- |
+| low | `gpt-6-luna` max | `claude-sonnet-5-5` low |
+| mid | `gpt-6.1-terra` high | `claude-sonnet-5-5` medium |
+| high | `gpt-6.1-sol` high | `claude-sonnet-5-5` high |
+| max | `gpt-6.1-sol` max | `claude-sonnet-5-5` max |
+
+Security opens one pane: `grok --yolo` while Grok has tokens, otherwise
+opus 5.5 at high effort, otherwise `gpt-6-astra` at high effort. Out of
+tokens means the five-hour or weekly window is fully used and has not reset.
+A signed-out agent is skipped.
+
+Kilix verbs such as `ls`, `focus`, `new-pane`, and `watch` are `kilix`
+commands. Route does not open a pane for them.
 
 ## Periodic prompts
 
@@ -297,7 +385,8 @@ beside a column that stacks `claudex_worker_2` over `claudex_worker_3`.
 
 - **Tokens:** the newest current evidence decides. Sources are the
   `claudex usage` reading (read again first when older than 15 minutes;
-  `--no-refresh` skips that and `--refresh` forces it), grok's billing log, and
+  `--no-refresh` skips that and `--refresh` forces it; Codex comes from the
+  `codex_usage` tmux `/status` screen), grok's billing log, and
   Codex rollouts for the Spark bucket (`codex_bengalfox`). A window at 100% that
   hasn't reset means no tokens. When nothing is known, the primary agent runs.
 - **Panes:** each pane holds at a shell when its agent exits. The caller's

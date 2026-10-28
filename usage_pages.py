@@ -473,13 +473,81 @@ def _label(item: dict) -> str:
     return label.replace("five_hour", "5 hour").replace("_", " ")
 
 
-def format_report(report: dict, *, now: float | None = None, color: bool = False, width: int = 12) -> str:
+_SUMMARY_LABEL = {"five_hour": "5h", "weekly": "weekly"}
+
+
+def summary_windows(entry: dict) -> list[dict]:
+    """The 5-hour and weekly account windows, in that order. Model and product splits stay out."""
+    found = {}
+    for item in entry.get("windows") or []:
+        name = item.get("name")
+        if name in _SUMMARY_LABEL and name not in found:
+            found[name] = item
+    return [found[name] for name in ("five_hour", "weekly") if name in found]
+
+
+def _compact_number(value):
+    if value is None:
+        return None
+    number = round(float(value), 1)
+    return int(number) if number == int(number) else number
+
+
+def summary_record(report: dict, *, basis: str = "remaining", verbose: bool = False) -> dict:
+    """Remaining 5-hour and weekly percents, small enough to paste into a prompt.
+
+    An agent that is not signed in is left out unless ``verbose``.
+    """
+    record = {}
+    for provider in LIMIT_PROVIDERS:
+        if provider not in report.get("providers", {}):
+            continue
+        entry = report["providers"][provider]
+        if entry.get("status") == "login_required" and not verbose:
+            continue
+        if entry.get("status") != "ok":
+            record[provider] = entry.get("status") or "error"
+            continue
+        record[provider] = {
+            _SUMMARY_LABEL[item["name"]]: _compact_number(_shown_percent(item, basis))
+            for item in summary_windows(entry)
+        }
+    return record
+
+
+def format_summary(report: dict, *, basis: str = "remaining", verbose: bool = False) -> str:
+    """One line. ``claude 5h 0 weekly 32`` is remaining percent, unless ``basis`` is ``used``."""
+    parts = []
+    for provider, value in summary_record(report, basis=basis, verbose=verbose).items():
+        if isinstance(value, str):
+            parts.append(f"{provider} {value}")
+            continue
+        bits = [f"{label} {number if number is not None else '-'}" for label, number in value.items()]
+        parts.append(f"{provider} {' '.join(bits) if bits else 'none'}")
+    return "; ".join(parts)
+
+
+def _shown_percent(item: dict, basis: str) -> float | None:
+    if basis == "used":
+        return item.get("used_percent")
+    remaining = item.get("remaining_percent")
+    if remaining is None and item.get("used_percent") is not None:
+        remaining = round(max(0.0, 100 - item["used_percent"]), 1)
+    return remaining
+
+
+def format_report(report: dict, *, now: float | None = None, color: bool = False, width: int = 12,
+                  basis: str = "remaining", verbose: bool = False) -> str:
+    """One row per window. The number is remaining usage unless ``basis`` is ``used``.
+
+    A tmux ``/status`` screen stored on the provider is printed only when ``verbose``.
+    """
     now = time.time() if now is None else now
     shown = [p for p in LIMIT_PROVIDERS if p in report.get("providers", {})]
     labels = [_label(w) for p in shown for w in report["providers"][p].get("windows") or []]
     column = min(40, max([len(label) for label in labels] + [len("WINDOW"), len("login_required")]))
-    lines = [f"{'AGENT':<8} {'WINDOW':<{column}} {'USED':<{width + 6}} RESETS"]
-    worst = 0.0
+    header = "USED" if basis == "used" else "REMAINING"
+    lines = [f"{'AGENT':<8} {'WINDOW':<{column}} {header:<{width + 6}} RESETS"]
     for provider in shown:
         entry = report["providers"][provider]
         if entry.get("status") != "ok":
@@ -487,20 +555,28 @@ def format_report(report: dict, *, now: float | None = None, color: bool = False
             lines.append(f"{provider:<8} {_paint(status, '33', color)}{' ' * (column - len(status))} {entry.get('reason', '')}")
             continue
         for item in entry.get("windows") or []:
-            used = item.get("used_percent")
-            worst = max(worst, used or 0)
-            filled = round(width * min(100.0, used or 0) / 100)
-            code = "31" if (used or 0) >= 100 else "33" if (used or 0) >= 80 else "32"
+            percent = _shown_percent(item, basis)
+            filled = round(width * min(100.0, percent or 0) / 100)
+            if basis == "used":
+                code = "31" if (percent or 0) >= 100 else "33" if (percent or 0) >= 80 else "32"
+            else:
+                code = "31" if (percent or 0) <= 0 else "33" if (percent or 0) <= 20 else "32"
             bar = _paint("█" * filled, code, color) + "░" * (width - filled)
             resets = item.get("resets_at")
             when = "unknown"
             if resets:
                 stamp = time.strftime("%a %H:%M" if resets - now < 6 * 86400 else "%b %d %H:%M", time.localtime(resets))
                 when = "now" if resets <= now else f"in {_until(resets - now)} ({stamp})"
-            lines.append(f"{provider:<8} {_label(item)[:column]:<{column}} {bar} {used:>5.1f}% {when}")
+            number = "  --  " if percent is None else f"{percent:>5.1f}%"
+            lines.append(f"{provider:<8} {_label(item)[:column]:<{column}} {bar} {number} {when}")
         age = now - entry.get("checked_at", now)
         if age > 3600:
             lines.append(f"{'':<8} {'':<{column}} read {_until(age)} ago")
+        screen = entry.get("screen")
+        if verbose and isinstance(screen, str) and screen.strip():
+            lines.append("")
+            lines.append(f"{provider} /status")
+            lines.append(screen.strip("\n"))
     return "\n".join(lines)
 
 

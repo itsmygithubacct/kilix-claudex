@@ -13,9 +13,11 @@ The tab uses kilix's splits layout, the same tree as the original claudex tab:
     claudex_worker_2      a ~/qwen-test model via the companion CLI
     claudex_worker_3      codex --yolo on gpt-5.3-codex-spark while Spark has tokens, else qwen via omp
 
-Token checks take the newest of three sources: the usage-page reading from
-``claudex usage`` (refreshed first when stale), grok's billing log, and Codex
-rollouts for the Spark limit bucket.
+Token checks take the newest of three sources: the ``claudex usage`` reading
+(refreshed first when stale; Codex comes from the ``codex_usage`` tmux
+``/status`` screen, and Grok comes from the grok CLI billing request), grok's
+billing log, and Codex rollouts for the Spark
+limit bucket.
 """
 from __future__ import annotations
 
@@ -35,6 +37,8 @@ import limits  # noqa: E402
 from pane_loop import default_config  # noqa: E402
 from providers import (CODEX_ID, COMPANION_COMMAND, COMPANION_SKIP_PERMISSIONS,  # noqa: E402
                        COMPANION_TEAM_MODEL, GROK_ID, QWEN_COMPANION_LAUNCHER, QWEN_OMP_LAUNCHER)
+import codex_status  # noqa: E402
+import grok_status  # noqa: E402
 import usage_pages  # noqa: E402
 
 TAB_TITLE = "claudex-team"
@@ -156,7 +160,7 @@ def token_check(kind: str, *, now: float, usage: dict, codex_home=None, grok_hom
 
 
 def refresh_usage(kinds, *, force: bool = False, now: float | None = None) -> tuple[dict, str | None]:
-    """Read the grok and codex usage pages when their cached reading is stale; never fatal."""
+    """Refresh a stale Codex /status reading and any stale usage pages. Never fatal."""
     now = time.time() if now is None else now
     path = usage_cache()
     usage = load_usage(path)
@@ -165,11 +169,29 @@ def refresh_usage(kinds, *, force: bool = False, now: float | None = None) -> tu
     stale = [p for p in wanted if force or now - ((cached.get(p) or {}).get("checked_at") or 0) > USAGE_MAX_AGE]
     if not stale:
         return usage, None
-    try:
-        report = usage_pages.read_usage(stale, app_dir() / "usage-browser", display="virtual", timeout=40)
-    except (browser.BrowserError, OSError) as error:
-        return usage, f"usage pages not refreshed ({error}); using cached and local evidence"
-    return usage_pages.merge_cache(path, report), None
+    notes = []
+    report = {"read_at": now, "providers": {}}
+    pages = [name for name in stale if name not in (CODEX_ID, GROK_ID)]
+    if pages:
+        try:
+            report = usage_pages.read_usage(pages, app_dir() / "usage-browser", display="virtual", timeout=40)
+        except (browser.BrowserError, OSError) as error:
+            notes.append(f"usage pages not refreshed ({error})")
+            report = {"read_at": now, "providers": {}}
+    if CODEX_ID in stale:
+        entry = codex_status.read()
+        report.setdefault("providers", {})[CODEX_ID] = entry
+        if entry.get("status") != "ok":
+            notes.append(f"codex status not refreshed ({entry.get('reason')})")
+    if GROK_ID in stale:
+        entry = grok_status.read()
+        report.setdefault("providers", {})[GROK_ID] = entry
+        if entry.get("status") != "ok":
+            notes.append(f"grok billing not refreshed ({entry.get('reason')})")
+    if report["providers"]:
+        usage = usage_pages.merge_cache(path, report)
+    note = "; ".join(notes)
+    return usage, f"{note}; using cached and local evidence" if note else None
 
 
 def make_plan(*, now: float | None = None, usage: dict | None = None, codex_home=None, grok_home=None) -> list[dict]:
