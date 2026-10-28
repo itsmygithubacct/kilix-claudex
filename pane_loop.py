@@ -22,7 +22,11 @@ import browser
 import dashboard
 from idleness import codex_queue_hint, composer_is_empty, composer_text
 from limits import CodexHistory, assess_limits, limit_report, pane_agent
-from providers import CODEX_ID, COMPANION_ID, LIMIT_PROVIDERS, SUPPORTED, USAGE_PAGES
+import claude_status
+import codex_status
+import grok_status
+from providers import CODEX_ID, COMPANION_ID, GROK_ID, LIMIT_PROVIDERS, SUPPORTED, USAGE_PAGES
+import route
 import usage_pages
 
 
@@ -817,16 +821,61 @@ def parser():
     board_actions.add_parser("status", help="report whether the dashboard is running")
     provider = board_actions.add_parser("provider", help="open official usage pages in kilix browse tabs")
     provider.add_argument("which", nargs="?", choices=(*LIMIT_PROVIDERS, "all"), default="all")
-    usage = commands.add_parser("usage", help="read percentages and reset times from the official usage pages")
+    usage = commands.add_parser(
+        "usage", help="read Codex and Claude from tmux, Grok from the grok CLI login, and Qwen from its usage page")
     usage.add_argument("words", nargs="*", metavar="[read|login|show|status] [AGENT ...]",
                        help=f"action (default read) and agents: {', '.join(LIMIT_PROVIDERS)} (default all)")
-    usage.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    output = usage.add_mutually_exclusive_group()
+    output.add_argument("--json", action="store_true", help="print the short reading as one JSON object")
+    output.add_argument("--human", action="store_true", help="print a table instead of the short line")
+    basis = usage.add_mutually_exclusive_group()
+    basis.add_argument("--remaining", action="store_true", help="report usage still left (this is the default)")
+    basis.add_argument("--used", action="store_true", help="report usage already consumed")
+    usage.add_argument("--full", action="store_true", help="print every window, reset time, and both percentages as JSON")
+    usage.add_argument("--verbose", action="store_true", help="with --full or --human, include the tmux /status screen")
     usage.add_argument("--display", choices=browser.DISPLAYS, default="virtual",
                        help="virtual: private Xvfb (default); screen: visible window; headless")
     usage.add_argument("--browser", metavar="COMMAND", help="Chrome executable (default google-chrome)")
     usage.add_argument("--timeout", type=float, default=45.0, metavar="SECONDS", help="per page (default 45)")
     usage.add_argument("--debug", action="store_true", help="write a redacted outline of each page's JSON keys")
+    route_cmd = commands.add_parser(
+        "route", help="open a named route: max, worker low|mid|high|max, security, grammar, shell, or needle")
+    route_cmd.add_argument("name", choices=route.ROUTE_NAMES)
+    route_cmd.add_argument(
+        "request", nargs="*", metavar="REQUEST",
+        help="for worker, the tier then the request; otherwise the request. A request must name a file that exists")
+    route_cmd.add_argument("--dry-run", action="store_true",
+                           help="print the model and whether the request parses, without opening a pane")
+    route_cmd.add_argument("--json", action="store_true",
+                           help="print the choice, the reason, and the usage numbers")
+    route_cmd.add_argument("--cwd", type=Path, help="working directory for the new panes (default: here)")
     return result
+
+
+def _simple_report(report: dict) -> dict:
+    providers = {}
+    for name, entry in (report.get("providers") or {}).items():
+        if isinstance(entry, dict):
+            entry = {key: value for key, value in entry.items() if key != "screen"}
+            entry["windows"] = usage_pages.summary_windows(entry)
+        providers[name] = entry
+    return {**report, "providers": providers}
+
+
+def _without_screens(report: dict) -> dict:
+    providers = {}
+    for name, entry in (report.get("providers") or {}).items():
+        if isinstance(entry, dict) and "screen" in entry:
+            entry = {key: value for key, value in entry.items() if key != "screen"}
+        providers[name] = entry
+    return {**report, "providers": providers}
+
+
+def _emit_usage(args, value):
+    if args.human:
+        return False
+    print(json.dumps(value, indent=2, ensure_ascii=False))
+    return True
 
 
 def usage_command(args, config_path, runtime):
@@ -838,33 +887,62 @@ def usage_command(args, config_path, runtime):
     providers = list(dict.fromkeys(words)) or list(LIMIT_PROVIDERS)
     profile = config_path.parent / "usage-browser"
     cache = runtime / "usage-pages.json"
+    basis = "used" if args.used else "remaining"
+    direct_note = {
+        CODEX_ID: "read from the codex_usage tmux session; sign in by running codex there",
+        COMPANION_ID: "read from the claude_usage tmux session; sign in by running claude there",
+        GROK_ID: "read from the grok CLI login; sign in with: grok login",
+    }
     if action == "login":
-        pid = browser.launch_login(profile, [USAGE_PAGES[name] for name in providers], args.browser)
-        value = {"status": "opened", "pid": pid, "profile": str(profile),
-                 "pages": {name: USAGE_PAGES[name] for name in providers},
-                 "next": "sign in on each page, close the window, then run: claudex usage"}
-        if args.json:
-            print(json.dumps(value, indent=2, ensure_ascii=False))
-        else:
-            print(f"Opened Chrome on the claudex usage profile (pid {pid}):")
+        pages = [name for name in providers if name not in direct_note]
+        notes = {name: direct_note[name] for name in providers if name in direct_note}
+        if not pages:
+            if _emit_usage(args, {"status": "tmux", **notes}):
+                return 0
             for name in providers:
-                print(f"  {name:<7} {USAGE_PAGES[name]}")
-            print("Sign in on each page, close the window, then run: claudex usage")
+                print(notes[name])
+            return 0
+        pid = browser.launch_login(profile, [USAGE_PAGES[name] for name in pages], args.browser)
+        value = {"status": "opened", "pid": pid, "profile": str(profile),
+                 "pages": {name: USAGE_PAGES[name] for name in pages},
+                 "next": "sign in on each page, close the window, then run: claudex usage", **notes}
+        if _emit_usage(args, value):
+            return 0
+        print(f"Opened Chrome on the claudex usage profile (pid {pid}):")
+        for name in pages:
+            print(f"  {name:<7} {USAGE_PAGES[name]}")
+        for name, note in notes.items():
+            print(f"  {name:<7} {note}")
+        print("Sign in on each page, close the window, then run: claudex usage")
         return 0
     if action == "status":
         try:
             last = json.loads(cache.read_text(encoding="utf-8")).get("read_at")
         except (OSError, ValueError):
             last = None
-        print(json.dumps({"profile": str(profile), "profile_exists": profile.is_dir(),
-                          "open_pid": browser.profile_owner(profile), "cache": str(cache), "last_read_at": last},
-                         indent=2))
+        value = {"profile": str(profile), "profile_exists": profile.is_dir(),
+                 "open_pid": browser.profile_owner(profile), "cache": str(cache), "last_read_at": last}
+        if _emit_usage(args, value):
+            return 0
+        print(f"profile {value['profile']} ({'present' if value['profile_exists'] else 'missing'})")
+        print(f"cache {value['cache']}")
+        print(f"last read {value['last_read_at']}")
         return 0
     if action == "read":
         if not math.isfinite(args.timeout) or args.timeout <= 0:
             raise LoopError("--timeout must be a positive number of seconds")
-        report = usage_pages.read_usage(providers, profile, display=args.display, binary=args.browser,
-                                        timeout=args.timeout, debug_dir=runtime if args.debug else None)
+        pages = [name for name in providers if name not in direct_note]
+        if pages:
+            report = usage_pages.read_usage(pages, profile, display=args.display, binary=args.browser,
+                                            timeout=args.timeout, debug_dir=runtime if args.debug else None)
+        else:
+            report = {"read_at": time.time(), "display": "direct", "providers": {}}
+        if CODEX_ID in providers:
+            report["providers"][CODEX_ID] = codex_status.read()
+        if COMPANION_ID in providers:
+            report["providers"][COMPANION_ID] = claude_status.read()
+        if GROK_ID in providers:
+            report["providers"][GROK_ID] = grok_status.read()
         usage_pages.merge_cache(cache, report)
     else:
         try:
@@ -873,12 +951,55 @@ def usage_command(args, config_path, runtime):
             raise LoopError("no usage pages have been read yet; run: claudex usage") from None
         report["providers"] = {name: entry for name, entry in (report.get("providers") or {}).items()
                                if name in providers}
-    if args.json:
-        print(json.dumps(report, indent=2, ensure_ascii=False))
+    if args.full or args.human:
+        shown = report if args.verbose else _without_screens(report)
+        if not args.full:
+            shown = _simple_report(shown)
+            if not args.verbose:
+                shown = {**shown, "providers": {
+                    name: entry for name, entry in shown["providers"].items()
+                    if not (isinstance(entry, dict) and entry.get("status") == "login_required")}}
+        if args.human:
+            print(usage_pages.format_report(
+                shown, color=sys.stdout.isatty() and not os.environ.get("NO_COLOR"),
+                basis=basis, verbose=args.verbose))
+        else:
+            print(json.dumps(shown, indent=2, ensure_ascii=False))
+    elif args.json:
+        print(json.dumps(usage_pages.summary_record(report, basis=basis, verbose=args.verbose),
+                         separators=(",", ":"), ensure_ascii=False))
     else:
-        print(usage_pages.format_report(report, color=sys.stdout.isatty() and not os.environ.get("NO_COLOR")))
+        print(usage_pages.format_summary(report, basis=basis, verbose=args.verbose))
     readable = any(entry.get("status") == "ok" for entry in report["providers"].values())
     return 2 if usage_pages.exhausted(report) else 0 if readable else 1
+
+
+def route_command(args, runtime):
+    words = list(args.request) if getattr(args, "request", None) is not None else None
+    if words is None:
+        words = []
+        if getattr(args, "tier", None):
+            words.append(args.tier)
+        if getattr(args, "prompt", None):
+            words.append(args.prompt)
+    try:
+        tier, prompt = route.split_request(args.name, words)
+    except route.RouteError as error:
+        raise LoopError(str(error)) from error
+    cwd = (args.cwd or Path.cwd()).expanduser().resolve()
+    if not cwd.is_dir():
+        raise LoopError(f"--cwd is not a directory: {cwd}")
+    try:
+        value = route.run(args.name, tier, cache=runtime / "usage-pages.json", cwd=cwd,
+                          dry_run=args.dry_run, prompt=prompt)
+    except route.RouteError as error:
+        raise LoopError(str(error)) from error
+    if args.json:
+        print(json.dumps(route.public_record(value), separators=(",", ":"), ensure_ascii=False))
+    else:
+        print(route.format_line(value))
+    request = value.get("request")
+    return 1 if isinstance(request, dict) and not request.get("ok") else 0
 
 
 def utf8_streams():
@@ -983,6 +1104,8 @@ def main(argv=None):
             value = {"status": worst, "panes": reports}
         elif args.command == "usage":
             return usage_command(args, config_path, runtime)
+        elif args.command == "route":
+            return route_command(args, runtime)
         elif args.command == "dashboard":
             if args.action in ("serve", "start", "open"):
                 if not 0 <= args.port <= 65535:
