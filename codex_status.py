@@ -23,6 +23,8 @@ import subprocess
 import time
 
 from usage_pages import window
+from idleness import composer_text
+from status_session import StatusSessionError, Transport, reader_lock
 
 SESSION = "codex_usage"
 # A plain `codex` here runs `npm install -g` on startup and exits when that
@@ -113,7 +115,7 @@ def latest_status(screen: str) -> str:
 
 def composer_contains(text: str, line: str) -> bool:
     """True when the Codex composer, the line beginning with ›, holds this command."""
-    return any("›" in raw and line in raw for raw in text.splitlines())
+    return composer_text("codex", text) == line
 
 
 def parse_limits(screen: str, now: float | None = None) -> tuple[list[dict], float | None]:
@@ -178,7 +180,7 @@ def _wait(capture, predicate, timeout: float, *, clock, sleep, interval: float =
         if stable >= 2 and predicate(latest):
             return latest
         sleep(interval)
-    return latest
+    raise CodexStatusError("timed out waiting for the status pane to become ready")
 
 
 def _excerpt(text: str) -> str:
@@ -231,9 +233,13 @@ def read(*, cwd: str | None = None, run=None, commands_for=None,
          clock=None, sleep=None, now: float | None = None) -> dict:
     """Read Codex /status. Failures become an error entry so the other agents still report."""
     try:
-        return _read(cwd=cwd, run=run or _run, commands_for=commands_for or descendant_commands,
-                     clock=clock or time.monotonic, sleep=sleep or time.sleep, now=now)
-    except CodexStatusError as error:
+        commands_for = commands_for or descendant_commands
+        with reader_lock(SESSION):
+            transport = Transport(run or _run, SESSION, "codex",
+                                  lambda pane: _pane_runs_codex(pane, commands_for))
+            return _read(cwd=cwd, run=transport, commands_for=commands_for,
+                         clock=clock or time.monotonic, sleep=sleep or time.sleep, now=now)
+    except (CodexStatusError, StatusSessionError, OSError, ValueError, TypeError) as error:
         return {"status": "error", "reason": str(error), "checked_at": time.time() if now is None else now,
                 "windows": [], "source": f"tmux {SESSION} /status"}
 
@@ -303,6 +309,8 @@ def _read(*, cwd, run, commands_for, clock, sleep, now) -> dict:
     screen = after_submit(first)
     screen = latest_status(screen)
     windows, context = parse_limits(screen, now)
+    if not windows:
+        raise CodexStatusError("the second status screen contained no account windows")
     entry = {"status": "ok", "checked_at": now, "source": f"tmux {SESSION} /status",
              "session": SESSION, "screen": screen, "windows": windows}
     if context is not None:

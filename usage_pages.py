@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import base64
 from contextlib import nullcontext
+import fcntl
 from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -48,7 +50,7 @@ def page_domain(url: str) -> str:
 
 
 def _number(value):
-    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    return float(value) if type(value) in (int, float) and math.isfinite(value) else None
 
 
 def _epoch(value):
@@ -69,6 +71,7 @@ def _epoch(value):
 
 
 def window(name, used, resets=None, *, seconds=None, label=None) -> dict:
+    used = _number(used)
     used = None if used is None else round(max(0.0, used), 1)
     return {"name": name, "label": label or name, "used_percent": used,
             "remaining_percent": None if used is None else round(max(0.0, 100 - used), 1),
@@ -394,7 +397,7 @@ def debug_outline(page: dict) -> dict:
         return out
 
     final = urlsplit(page.get("final_url") or "")
-    return {"final_url": f"{final.netloc}{final.path}", "title": page.get("title"),
+    return {"final_url": f"{final.netloc}{final.path}", "title": "<redacted>",
             "responses": [{"url": "".join(urlsplit(r.get("url") or "")[1:3]), "status": r.get("status"),
                            "keys": outline(r.get("body")) if not r.get("raw") else _proto_outline(r["raw"])}
                           for r in page.get("responses") or []]}
@@ -445,14 +448,27 @@ def write_private(path: Path, value) -> Path:
 
 def merge_cache(path: Path, report: dict) -> dict:
     """Keep earlier readings for providers this run didn't read."""
-    try:
-        cached = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        cached = {}
-    providers = cached.get("providers") if isinstance(cached.get("providers"), dict) else {}
-    merged = {**report, "providers": {**providers, **report["providers"]}}
-    write_private(path, merged)
-    return merged
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path.with_suffix(".lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            cached = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cached = {}
+        providers = cached.get("providers") if isinstance(cached, dict) else None
+        providers = dict(providers) if isinstance(providers, dict) else {}
+        for name, entry in report["providers"].items():
+            old = providers.get(name)
+            old_at = old.get("checked_at") if isinstance(old, dict) else None
+            new_at = entry.get("checked_at") if isinstance(entry, dict) else None
+            if (type(old_at) in (int, float) and type(new_at) in (int, float) and old_at > new_at):
+                continue
+            providers[name] = entry
+        merged = {**report, "providers": providers}
+        write_private(path, merged)
+        return merged
 
 
 # --- report -----------------------------------------------------------------

@@ -24,6 +24,8 @@ import time
 
 from codex_status import SHELLS, descendant_commands, session_listed
 from usage_pages import window
+from idleness import composer_text
+from status_session import StatusSessionError, Transport, reader_lock
 
 SESSION = "claude_usage"
 CLAUDE_LAUNCH = "claude"
@@ -68,12 +70,14 @@ def status_open(text: str) -> bool:
     """The /status dialog is the visible page, not an old copy in scrollback."""
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     tail = "\n".join(lines[-40:]).lower()
-    return "esc to cancel" in tail and "settings" in tail and "usage" in tail
+    return (any("esc to cancel" in line.lower() for line in lines[-3:])
+            and "settings" in tail and "usage" in tail
+            and not any(line.startswith("❯") for line in lines[-3:]))
 
 
 def composer_contains(text: str, line: str) -> bool:
     """True when the Claude composer, the line containing ❯, holds this command."""
-    return any("❯" in raw and line in raw for raw in text.splitlines())
+    return composer_text("claude", text) == line
 
 
 def latest_page(screen: str) -> str:
@@ -221,7 +225,7 @@ def _wait(capture, predicate, timeout: float, *, clock, sleep, interval: float =
         if stable >= 2 and predicate(latest):
             return latest
         sleep(interval)
-    return latest
+    raise ClaudeStatusError("timed out waiting for the status pane to become ready")
 
 
 def _excerpt(text: str) -> str:
@@ -242,9 +246,13 @@ def read(*, cwd: str | None = None, run=None, commands_for=None,
          clock=None, sleep=None, now: float | None = None) -> dict:
     """Read Claude /status. Failures become an error entry so the other agents still report."""
     try:
-        return _read(cwd=cwd, run=run or _run, commands_for=commands_for or descendant_commands,
-                     clock=clock or time.monotonic, sleep=sleep or time.sleep, now=now)
-    except ClaudeStatusError as error:
+        commands_for = commands_for or descendant_commands
+        with reader_lock(SESSION):
+            transport = Transport(run or _run, SESSION, "claude",
+                                  lambda pane: _pane_runs_claude(pane, commands_for))
+            return _read(cwd=cwd, run=transport, commands_for=commands_for,
+                         clock=clock or time.monotonic, sleep=sleep or time.sleep, now=now)
+    except (ClaudeStatusError, StatusSessionError, OSError, ValueError, TypeError) as error:
         return {"status": "error", "reason": str(error), "checked_at": time.time() if now is None else now,
                 "windows": [], "source": f"tmux {SESSION} /status"}
 

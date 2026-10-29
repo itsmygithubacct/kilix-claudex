@@ -65,7 +65,7 @@ class ReadTests(unittest.TestCase):
             raise urllib.error.URLError("down")
         entry = grok_status.read(now=1_000.0, home=self._home("token"), fetch=fetch)
         self.assertEqual(entry["status"], "error")
-        self.assertIn("down", entry["reason"])
+        self.assertIn("network or protocol error", entry["reason"])
 
     def _home(self, token):
         import tempfile

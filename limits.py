@@ -41,6 +41,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -103,7 +104,7 @@ def _epoch(value):
 
 
 def _number(value):
-    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    return value if type(value) in (int, float) and math.isfinite(value) else None
 
 
 def _mtime(path: Path) -> float:
@@ -160,14 +161,8 @@ def _window(*, now, used=None, resets=None, **extra) -> dict:
 # --- codex ----------------------------------------------------------------
 
 def recent_codex_rollouts(home=None, count: int = 6) -> list[Path]:
-    """The most recently written rollouts, found newest day first."""
-    candidates: list[Path] = []
-    for year in _subdirs(codex_home(home) / "sessions"):
-        for month in _subdirs(year):
-            for day in _subdirs(month):
-                candidates.extend(day.glob("rollout-*.jsonl"))
-                if len(candidates) >= count * 4:
-                    return sorted(candidates, key=_mtime, reverse=True)[:count]
+    """Newest writes, including sessions that started in an older directory."""
+    candidates = (codex_home(home) / "sessions").glob("*/*/*/rollout-*.jsonl")
     return sorted(candidates, key=_mtime, reverse=True)[:count]
 
 

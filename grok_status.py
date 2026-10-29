@@ -20,6 +20,13 @@ from usage_pages import grok_windows
 BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 SOURCE = "grok cli billing"
 _TIMEOUT = 20.0
+_BODY_LIMIT = 1 << 20
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # urllib otherwise forwards Authorization when a redirect changes host.
+        return None
 
 
 class GrokStatusError(Exception):
@@ -60,12 +67,16 @@ def _fetch(token: str, version: str | None) -> tuple[int, dict | None]:
         headers["x-grok-client-version"] = version
     request = urllib.request.Request(BILLING_URL, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
-            payload = response.read()
+        opener = urllib.request.build_opener(_NoRedirect())
+        with opener.open(request, timeout=_TIMEOUT) as response:
+            payload = response.read(_BODY_LIMIT + 1)
             status = response.status
     except urllib.error.HTTPError as error:
-        payload = error.read()
+        payload = error.read(_BODY_LIMIT + 1)
         status = error.code
+        error.close()
+    if len(payload) > _BODY_LIMIT:
+        raise GrokStatusError("grok billing response exceeded the size limit")
     try:
         body = json.loads(payload.decode("utf-8"))
     except (UnicodeError, ValueError):
@@ -90,8 +101,9 @@ def _read(*, now: float, home: Path, fetch) -> dict:
                 "checked_at": now, "windows": [], "source": SOURCE}
     try:
         status, body = fetch(token, _client_version(home))
-    except (OSError, urllib.error.URLError) as error:
-        raise GrokStatusError(f"grok billing request failed ({error})") from error
+    except (OSError, ValueError, urllib.error.URLError) as error:
+        # Invalid credential headers can occur in exception text. Never echo it.
+        raise GrokStatusError("grok billing request failed (network or protocol error)") from error
     if status in (401, 403):
         return {"status": "login_required", "reason": "not signed in; run: grok login",
                 "checked_at": now, "windows": [], "source": SOURCE}

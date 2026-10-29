@@ -4,3 +4,5 @@ __pycache__/
 /.loop/
 /loop.json
 /prompt.txt
+/usage.sh
+/usage-browser/

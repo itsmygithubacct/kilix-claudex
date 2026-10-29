@@ -1,6 +1,9 @@
 import json
+import os
 import subprocess
+import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -56,8 +59,8 @@ class Session:
         self.pending = None
         self.rights = 0
         self.screens = {
-            "shell": "pleb@plebtop:~/claudex$\n",
-            "ready": "❯ Try something\n",
+            "shell": "operator@host:~$\n",
+            "ready": "────────────\n❯ \n────────────\n",
             "dialog": DIALOG,
             "usage": USAGE,
         }
@@ -72,7 +75,7 @@ class Session:
             return completed(0, claude_status.SESSION + "\n")
         if args[0] == "show":
             return completed(0, json.dumps({"ok": True, "data": {"panes": [{
-                "command": self.command, "pid": 9, "active": True}]}}))
+                "pane_id": "%9", "window": "0", "pane": "0", "command": self.command, "pid": 9, "active": True}]}}))
         if args[0] == "type":
             if args[2] == claude_status.CLAUDE_LAUNCH:
                 self.command = "claude"
@@ -98,7 +101,7 @@ class Session:
         if args[0] == "capture":
             screen = self.screens[self.phase]
             if self.pending:
-                screen += f"❯ {self.pending}\n"
+                screen += f"────────────\n❯ {self.pending}\n────────────\n"
             return completed(0, screen)
         return completed(1, stderr=f"unexpected {' '.join(args)}")
 
@@ -136,6 +139,13 @@ class ParseTests(unittest.TestCase):
 
 
 class ReadTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        env = patch.dict(os.environ, {"XDG_CACHE_HOME": folder.name})
+        env.start()
+        self.addCleanup(env.stop)
+
     def read(self, session):
         clock = Clock()
         return claude_status.read(cwd="/home/pleb/claudex", run=session.run,
@@ -152,8 +162,8 @@ class ReadTests(unittest.TestCase):
         typed = [call[2] for call in session.calls if call[0] == "type"]
         self.assertEqual(typed, [claude_status.CLAUDE_LAUNCH])
         self.assertEqual([call[2] for call in session.calls if call[0] == "send"], ["/status"])
-        enter = next(index for index, call in enumerate(session.calls) if call[:3] == ["key", "claude_usage", "Enter"])
-        rights = [index for index, call in enumerate(session.calls) if call[:3] == ["key", "claude_usage", "Right"]]
+        enter = next(index for index, call in enumerate(session.calls) if call[:3] == ["key", "claude_usage:0.0", "Enter"])
+        rights = [index for index, call in enumerate(session.calls) if call[:3] == ["key", "claude_usage:0.0", "Right"]]
         self.assertEqual(len(rights), 2)
         self.assertGreater(rights[0], enter)
         last_send = max(index for index, call in enumerate(session.calls) if call[0] == "send")

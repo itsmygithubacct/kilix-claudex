@@ -29,7 +29,7 @@ class Launch:
     def __call__(self, *args):
         self.calls.append(args)
         self.next_id += 1
-        return str(self.next_id)
+        return {"status": "created", "pane": {"pane_id": self.next_id}}
 
 
 class ChoiceTests(unittest.TestCase):
@@ -203,8 +203,10 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(decision["sessions"][0]["effort"], "xhigh")
         self.assertEqual(decision["refreshed"], [GROK_ID])
         self.assertEqual(decision["window_ids"], [401])
-        self.assertEqual(launch.calls[0][0], "launch")
-        self.assertTrue(any("claudex-route-max" in str(arg) for arg in launch.calls[0]))
+        self.assertEqual(launch.calls[0][:4], ("grid", "add", "--name", "claudex-route"))
+        self.assertIn("--new", launch.calls[0])
+        self.assertEqual(launch.calls[0][launch.calls[0].index("--title") + 1], "claudex-route-max")
+        self.assertNotIn("--no-hold", launch.calls[0])
 
     def test_security_does_not_read_claude_when_grok_has_tokens(self):
         self.write(usage((GROK_ID, [window("weekly", 40)]), checked_at=NOW - 60))
@@ -219,8 +221,12 @@ class CacheTests(unittest.TestCase):
                              readers=self.readers(), launch=launch)
         self.assertEqual(self.calls, [])
         self.assertEqual(decision["window_ids"], [401, 402])
-        self.assertIn("--location=vsplit", launch.calls[1])
-        self.assertIn("--next-to", launch.calls[1])
+        self.assertEqual(launch.calls[0][:4], ("grid", "add", "--name", "claudex-route"))
+        self.assertIn("--new", launch.calls[0])
+        self.assertIn("--into", launch.calls[1])
+        self.assertEqual(launch.calls[1][launch.calls[1].index("--into") + 1], "401")
+        self.assertNotIn("--location=vsplit", launch.calls[1])
+        self.assertIn("--", launch.calls[1])
         self.assertTrue(route.format_line(decision).startswith(
             "opened worker low codex gpt-6-luna max; claude claude-sonnet-5-5 low"))
 

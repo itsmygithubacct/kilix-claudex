@@ -133,7 +133,7 @@ def make_server(build, port: int, *, host: str = "127.0.0.1", ttl: float = 15.0)
     return server
 
 
-PAGE = """<!doctype html>
+PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">

@@ -37,6 +37,7 @@ reset. Add another algorithm by extending ``ROUTE_NAMES`` and ``run``.
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -49,7 +50,7 @@ import usage_pages
 USAGE_TTL = 30 * 60
 ROUTE_NAMES = ("max", "worker", "security")
 WORKER_TIERS = ("low", "mid", "high", "max")
-ACCOUNT_WINDOWS = ("five_hour", "weekly")
+ACCOUNT_WINDOWS = ("five_hour", "weekly", "monthly", "period")
 _LABEL = {"five_hour": "5h", "weekly": "weekly"}
 
 # Model ids from the local Codex and Claude catalogs.
@@ -124,7 +125,12 @@ def usable(entry, now: float) -> bool:
 
 def fresh(entry, now: float) -> bool:
     checked = entry.get("checked_at") if isinstance(entry, dict) else None
-    return isinstance(checked, (int, float)) and now - checked < USAGE_TTL
+    if (type(checked) not in (int, float) or not math.isfinite(checked)
+            or not 0 <= now - checked < USAGE_TTL):
+        return False
+    # A cache TTL must not extend a window beyond its known reset.
+    return not any(isinstance(w, dict) and type(w.get("resets_at")) in (int, float)
+                   and w["resets_at"] <= now for w in entry.get("windows") or [])
 
 
 def load_usage(path: Path) -> dict:
@@ -375,43 +381,54 @@ def _with_prompt(sessions, prompt: str) -> list:
     for session in sessions:
         argv = list(session["argv"])
         if session["agent"] in (CODEX_ID, COMPANION_ID, GROK_ID):
-            argv.append(prompt)
+            argv.extend(["--", prompt])
         attached.append({**session, "argv": argv})
     return attached
 
 
-def kilix_launch(*args: str) -> str:
+def kilix_launch(*args: str) -> dict:
+    """Run ``kilix session ARGS`` and return its JSON receipt."""
     try:
-        done = subprocess.run(["kilix", "@", *args], capture_output=True, text=True, timeout=30)
+        done = subprocess.run(["kilix", "session", *args], capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired) as error:
-        raise RouteError(f"kilix @ {args[0]} failed: {error}") from error
-    if done.returncode:
-        raise RouteError(done.stderr.strip() or f"kilix @ {args[0]} exited {done.returncode}")
-    return done.stdout.strip()
+        raise RouteError(f"kilix session {args[0] if args else ''} failed: {error}") from error
+    try:
+        value = json.loads(done.stdout or "null")
+    except ValueError:
+        value = None
+    if done.returncode or not isinstance(value, dict):
+        reason = value.get("error") if isinstance(value, dict) else None
+        raise RouteError(reason or (done.stderr or "").strip() or f"kilix session exited {done.returncode}")
+    return value
 
 
 def open_sessions(sessions, *, cwd: Path, launch) -> tuple[list, list]:
-    """Open the first session as a tab and each later session beside it."""
+    """Open the first session as a new grid tab; later sessions join that grid.
+
+    ``launch`` is ``kilix session`` and returns the JSON receipt. The grid does
+    not take focus, and a pane holds when its command exits.
+    """
     tab = "claudex-route"
     ids: list = []
     commands = []
     for index, session in enumerate(sessions):
-        if index == 0:
-            where = ["--type=tab", f"--tab-title={tab}"]
-        else:
-            where = ["--match", f"window_id:{ids[0]}", "--type=window", "--location=vsplit",
-                     "--next-to", f"id:{ids[0]}"]
-        args = ["launch", *where, f"--title={session['title']}", f"--cwd={cwd}", "--hold",
-                "--keep-focus", "--env", f"PATH={os.environ.get('PATH', '')}", *session["argv"]]
+        where = ["--new"] if index == 0 else ["--into", str(ids[0])]
+        args = ["grid", "add", "--name", tab, *where, "--title", session["title"],
+                "--cwd", str(cwd), "--env", f"PATH={os.environ.get('PATH', '')}",
+                "--", *session["argv"]]
         commands.append(args)
         if launch is None:
             ids.append(None)
             continue
-        output = launch(*args)
         try:
-            ids.append(int(str(output).split()[-1]))
-        except (ValueError, IndexError) as error:
-            raise RouteError(f"kilix returned no window id for {session['title']}: {output!r}") from error
+            receipt = launch(*args)
+            pane_id = receipt["pane"]["pane_id"]
+            if type(pane_id) is not int or pane_id <= 0:
+                raise ValueError("receipt has no positive integer pane id")
+            ids.append(pane_id)
+        except (RouteError, KeyError, TypeError, ValueError) as error:
+            raise RouteError(f"launch failed for {session['title']}: {error}; "
+                             f"confirmed panes already opened: {ids}; inspect before retrying") from error
     return commands, ids
 
 

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Launch and check the five-pane claudex team tab in kilix.
 
-The tab uses kilix's splits layout, the same tree as the original claudex tab:
+The tab is a kilix session grid (``kilix session grid add``): two rows, filled
+column by column in launch order, so the team reads left to right as
 
-    | orchestrator | companion | worker_1 | worker_2 |
-    |              |           |          |----------|
-    |              |           |          | worker_3 |
+    | orchestrator | worker_1 | worker_3 |
+    |--------------|----------|          |
+    | companion    | worker_2 |          |
 
     claudex-orchestrator  codex --yolo on gpt-6-astra at max reasoning effort
     claudex-companion     the companion CLI on its flagship model, permissions skipped
@@ -16,8 +17,7 @@ The tab uses kilix's splits layout, the same tree as the original claudex tab:
 Token checks take the newest of three sources: the ``claudex usage`` reading
 (refreshed first when stale; Codex comes from the ``codex_usage`` tmux
 ``/status`` screen, and Grok comes from the grok CLI billing request), grok's
-billing log, and Codex rollouts for the Spark
-limit bucket.
+billing log, and Codex rollouts for the Spark limit bucket.
 """
 from __future__ import annotations
 
@@ -46,11 +46,9 @@ QWEN_MODEL_ALIAS = "max"
 SPARK_MODEL = "gpt-5.3-codex-spark"
 SPARK_LIMIT_ID = "codex_bengalfox"  # the Spark bucket in Codex rollouts
 USAGE_MAX_AGE = 15 * 60
-# (role, split location, the pane it splits); the first pane opens the tab.
-LAYOUT = (("orchestrator", None, None), ("worker_1", "vsplit", "orchestrator"),
-          ("companion", "vsplit", "orchestrator"), ("worker_2", "vsplit", "worker_1"),
-          ("worker_3", "hsplit", "worker_2"))
-EXPECTED_SHAPE = ("h", ("h", "orchestrator", "companion"), ("h", "worker_1", ("v", "worker_2", "worker_3")))
+GRID_LAYOUT = "sessions"
+# Launch order, which is also the grid's pane order: the first pane opens the tab.
+ORDER = ("orchestrator", "companion", "worker_1", "worker_2", "worker_3")
 TOKEN_PROVIDERS = {"grok": GROK_ID, "spark": CODEX_ID}
 
 
@@ -233,12 +231,29 @@ class Kilix:
             raise TeamError(done.stderr.strip() or f"kilix @ {args[0]} exited {done.returncode}")
         return done.stdout.strip()
 
+    def session(self, *args: str) -> dict:
+        """Run ``kilix session ARGS`` and return its JSON receipt."""
+        try:
+            done = subprocess.run([self.executable, "session", *args], capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise TeamError(f"kilix session {args[0]} failed: {error}") from error
+        try:
+            value = json.loads(done.stdout or "null")
+        except ValueError:
+            value = None
+        if done.returncode or not isinstance(value, dict):
+            reason = value.get("error") if isinstance(value, dict) else None
+            raise TeamError(reason or done.stderr.strip() or f"kilix session {args[0]} exited {done.returncode}")
+        return value
+
     def ls(self) -> list:
         try:
             value = json.loads(self.run("ls") or "[]")
         except ValueError as error:
             raise TeamError("kilix @ ls did not return JSON") from error
-        return value if isinstance(value, list) else []
+        if not isinstance(value, list):
+            raise TeamError("kilix @ ls did not return a window list")
+        return value
 
     def panes(self) -> dict:
         executable = os.environ.get("CLAUDEX_KILIX_PANES", "kilix-panes")
@@ -259,21 +274,17 @@ def windows_by_title(ls) -> dict[str, list[tuple[dict, dict]]]:
     return found
 
 
-def layout_shape(tab: dict, names: dict):
-    """The tab's split tree as nested ``(axis, one, two)`` tuples of role names; ``h`` is side by side."""
+def grid_order(tab: dict, names: dict) -> tuple:
+    """Role names in the tab's grid order: its window groups, else its windows."""
     state = tab.get("layout_state") or {}
-    groups = {g.get("id"): g.get("window_ids") or [] for g in (state.get("all_windows") or {}).get("window_groups") or []}
+    groups = [g.get("window_ids") or [] for g in (state.get("all_windows") or {}).get("window_groups") or []]
     titles = {w.get("id"): w.get("title") for w in tab.get("windows") or []}
+    ids = [group[0] for group in groups if group] or list(titles)
+    return tuple(names.get(titles.get(i), titles.get(i)) for i in ids)
 
-    def walk(node):
-        if isinstance(node, int):
-            ids = groups.get(node) or []
-            return names.get(titles.get(ids[0]), titles.get(ids[0])) if ids else None
-        if not isinstance(node, dict) or "one" not in node:
-            return None
-        return ("h" if node.get("horizontal", True) else "v", walk(node.get("one")), walk(node.get("two")))
 
-    return walk(state.get("pairs"))
+def layout_matches(tab: dict, names: dict) -> bool:
+    return tab.get("layout") == GRID_LAYOUT and grid_order(tab, names) == ORDER
 
 
 def launch(kilix, plan: list[dict], *, cwd: Path, placeholder: bool = False, allow_duplicates: bool = False,
@@ -291,41 +302,46 @@ def launch(kilix, plan: list[dict], *, cwd: Path, placeholder: bool = False, all
     tab_title = f"{TAB_TITLE}-test" if placeholder else TAB_TITLE
     ids: dict[str, object] = {}
     commands = []
-    for role, location, anchor in LAYOUT:
+    for role in ORDER:
         argv = members[role]["chosen"]["argv"]
         if placeholder:
             argv = ["bash", "-c", f"printf '%s\\n' {shlex.quote(titles[role] + ': ' + shlex.join(argv))}; exec bash"]
-        where = (["--type=tab", f"--tab-title={tab_title}"] if location is None else
-                 ["--match", f"window_id:{ids['orchestrator']}", "--type=window", f"--location={location}",
-                  "--next-to", f"id:{ids[anchor]}"])
-        args = ["launch", *where, f"--title={titles[role]}", f"--cwd={cwd}", "--hold", "--keep-focus",
-                "--var", f"claudex_team={role}", "--env", f"PATH={os.environ.get('PATH', '')}", *argv]
-        commands.append({"role": role, "title": titles[role], "argv": argv, "kilix": ["kilix", "@", *args]})
+        # The orchestrator opens a new grid tab; the rest join the grid that holds it.
+        where = ["--new"] if role == ORDER[0] else ["--into", str(ids[ORDER[0]])]
+        args = ["grid", "add", "--name", tab_title, *where, "--title", titles[role], "--cwd", str(cwd),
+                "--var", f"claudex_team={role}", "--env", f"PATH={os.environ.get('PATH', '')}", "--", *argv]
+        commands.append({"role": role, "title": titles[role], "argv": argv, "kilix": ["kilix", "session", *args]})
         if dry_run:
             ids[role] = role
             continue
-        output = kilix.run(*args)
         try:
-            ids[role] = int(output.split()[-1])
-        except (ValueError, IndexError) as error:
-            raise TeamError(f"kilix returned no window id for {titles[role]}: {output!r}") from error
+            receipt = kilix.session(*args)
+            pane_id = receipt["pane"]["pane_id"]
+            if type(pane_id) is not int or pane_id <= 0:
+                raise ValueError("receipt has no positive integer pane id")
+            ids[role] = pane_id
+        except (TeamError, KeyError, TypeError, ValueError) as error:
+            raise TeamError(f"launch failed for {titles[role]}: {error}; "
+                            f"confirmed panes already opened: {ids}; inspect before retrying") from error
     if not dry_run and not background:
         kilix.run("focus-window", "--match", f"id:{ids['orchestrator']}")
     return {"status": "planned" if dry_run else "launched", "tab_title": tab_title,
             "window_ids": ids, "commands": commands}
 
 
-def status(kilix, *, now: float | None = None, usage: dict | None = None, codex_home=None, grok_home=None) -> dict:
+def status(kilix, *, now: float | None = None, usage: dict | None = None, codex_home=None, grok_home=None,
+           placeholder: bool = False) -> dict:
     now = time.time() if now is None else now
     by_title = windows_by_title(kilix.ls())
     panes = kilix.panes()
     plan = make_plan(now=now, usage=usage, codex_home=codex_home, grok_home=grok_home)
-    names = {member["title"]: member["role"] for member in plan}
+    prefix = "test-" if placeholder else ""
+    names = {prefix + member["title"]: member["role"] for member in plan}
     members, tabs = [], {}
     for member in plan:
-        row = {"role": member["role"], "title": member["title"], "planned": member["chosen"]["name"],
+        row = {"role": member["role"], "title": prefix + member["title"], "planned": member["chosen"]["name"],
                "checks": member["checks"], "windows": []}
-        for tab, window in by_title.get(member["title"]) or []:
+        for tab, window in by_title.get(prefix + member["title"]) or []:
             pane = panes.get(window.get("id")) or {}
             agent = limits.pane_agent(pane)[0] if pane else ""
             argv = (pane.get("process") or {}).get("argv") or []
@@ -337,9 +353,8 @@ def status(kilix, *, now: float | None = None, usage: dict | None = None, codex_
         members.append(row)
     layouts = []
     for tab_id, tab in tabs.items():
-        shape = layout_shape(tab, names)
-        layouts.append({"tab_id": tab_id, "tab_title": tab.get("title"), "matches": shape == EXPECTED_SHAPE,
-                        "shape": shape})
+        layouts.append({"tab_id": tab_id, "tab_title": tab.get("title"), "layout": tab.get("layout"),
+                        "order": list(grid_order(tab, names)), "matches": layout_matches(tab, names)})
     ready = all(len(row["windows"]) == 1 for row in members) and len(layouts) == 1 and layouts[0]["matches"]
     return {"status": "ok" if ready else "incomplete", "members": members, "layouts": layouts}
 
@@ -375,7 +390,8 @@ def print_status(value) -> None:
             print(f"{row['role']:<13} {row['title']:<21} {window['window_id']!s:<6} {tab:<24} "
                   f"{window['agent'] or '-':<7} {window['activity'] or '-':<9} {(window['command'] or '-')[:60]}")
     for layout in value["layouts"]:
-        verdict = "matches the team layout" if layout["matches"] else f"differs from the team layout: {layout['shape']}"
+        verdict = ("matches the team layout" if layout["matches"] else
+                   f"differs from the team layout: {layout['layout']} {', '.join(map(str, layout['order']))}")
         print(f"layout: tab {layout['tab_id']} {layout['tab_title']!r} {verdict}")
     for name, check in checks.items():
         print(f"tokens: {name}: {check['state']}, {check['reason']}" + (f" ({check['source']})" if check.get("source") else ""))
@@ -389,9 +405,12 @@ def main(argv=None) -> int:
                        ("status", "find the team panes and check their layout, commands and tokens")):
         sub = commands.add_parser(name, help=text)
         sub.add_argument("--json", action="store_true", help="print JSON")
+        if name == "status":
+            sub.add_argument("--placeholder", action="store_true", help="check the test-* panes of a placeholder launch")
         if name != "status":
             freshness = sub.add_mutually_exclusive_group()
-            freshness.add_argument("--refresh", action="store_true", help="read the grok and codex usage pages first")
+            freshness.add_argument("--refresh", action="store_true",
+                                   help="read Codex /status and the grok billing request first")
             freshness.add_argument("--no-refresh", action="store_true", help="use cached and local usage evidence only")
     start = commands.choices["launch"]
     start.add_argument("--cwd", type=Path, default=Path.cwd(), help="working directory for every pane (default: here)")
@@ -404,7 +423,7 @@ def main(argv=None) -> int:
     kilix = Kilix()
     try:
         if args.command == "status":
-            value = status(kilix)
+            value = status(kilix, placeholder=args.placeholder)
             print(json.dumps(value, indent=2, ensure_ascii=False)) if args.json else print_status(value)
             return 0 if value["status"] == "ok" else 2
         note = usage = None
@@ -431,7 +450,7 @@ def main(argv=None) -> int:
                 for command in value["commands"]:
                     print("  " + shlex.join(command["kilix"]))
         return 0
-    except TeamError as error:
+    except (TeamError, browser.BrowserError, OSError, ValueError) as error:
         print(json.dumps({"status": "error", "reason": str(error)}))
         print(f"claudex_team.py: {error}", file=sys.stderr)
         return 1

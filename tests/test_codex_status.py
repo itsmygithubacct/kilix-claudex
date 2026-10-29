@@ -1,6 +1,9 @@
 import json
+import os
 import subprocess
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import codex_status
 
@@ -32,10 +35,10 @@ class Session:
         self.phase = "shell"
         self.pending = None
         self.screens = {
-            "shell": "pleb@plebtop:~/claudex$\n",
-            "ready": "› Implement the task\n gpt-5.3-codex\n",
-            "status1": "5-hour limit 10% left\nWeekly limit 10% left\n",
-            "status2": "5-hour limit 25% left\nWeekly limit 55% left\nContext window 12% used\n",
+            "shell": "operator@host:~$\n",
+            "ready": "› \n gpt-5.3-codex\n",
+            "status1": "5-hour limit 10% left\nWeekly limit 10% left\n› \n footer\n",
+            "status2": "5-hour limit 25% left\nWeekly limit 55% left\nContext window 12% used\n› \n footer\n",
         }
 
     def run(self, args, timeout=20):
@@ -48,7 +51,7 @@ class Session:
             return completed(0, codex_status.SESSION + "\n")
         if args[0] == "show":
             return completed(0, json.dumps({"ok": True, "data": {"panes": [{
-                "command": self.command, "pid": 9, "active": True}]}}))
+                "pane_id": "%9", "window": "0", "pane": "0", "command": self.command, "pid": 9, "active": True}]}}))
         if args[0] == "type":
             if args[2] == codex_status.CODEX_LAUNCH:
                 self.command = "codex"
@@ -64,7 +67,7 @@ class Session:
         if args[0] == "capture":
             screen = self.screens[self.phase]
             if self.pending:
-                screen += f"› {self.pending}\n"
+                screen += f"› {self.pending}\n footer\n"
             return completed(0, screen)
         return completed(1, stderr=f"unexpected {' '.join(args)}")
 
@@ -103,6 +106,13 @@ class ParseTests(unittest.TestCase):
 
 
 class ReadTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        env = patch.dict(os.environ, {"XDG_CACHE_HOME": folder.name})
+        env.start()
+        self.addCleanup(env.stop)
+
     def read(self, session):
         clock = Clock()
         return codex_status.read(cwd="/home/pleb/claudex", run=session.run,

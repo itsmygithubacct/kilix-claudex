@@ -74,15 +74,18 @@ def save_delivery(runtime, evidence):
 def record_attempt(runtime, evidence):
     try:
         yield
-    except Exception as error:  # any failure after typing must keep its evidence
+    except (Exception, KeyboardInterrupt) as error:  # keep evidence even on Ctrl-C after typing
+        if isinstance(error, KeyboardInterrupt) and not evidence["text_attempted"]:
+            raise
+        reason = str(error) or "interrupted during delivery"
         evidence.update(status="uncertain" if evidence["text_attempted"] else "error",
-                        reason=str(error), checked_at=time.time())
+                        reason=reason, checked_at=time.time())
         if evidence["text_attempted"]:
             try:
                 save_delivery(runtime, evidence)
             except OSError as persistence_error:
                 evidence["persistence_error"] = str(persistence_error)
-        raise DeliveryError(str(error), evidence, fatal=isinstance(error, TargetChanged)) from error
+        raise DeliveryError(reason, evidence, fatal=isinstance(error, TargetChanged)) from error
 
 
 def atomic_write(path, value, *, overwrite=True):
@@ -678,6 +681,12 @@ def dashboard_healthy(port):
 
 
 def serve_dashboard(runtime, client, port, targets, low_percent):
+    # A second port must not overwrite the process record of a live server.
+    with exclusive(runtime / "dashboard.lock"):
+        return _serve_dashboard(runtime, client, port, targets, low_percent)
+
+
+def _serve_dashboard(runtime, client, port, targets, low_percent):
     server = dashboard.make_server(dashboard_report_builder(client, targets, low_percent), port)
     actual = server.server_address[1]
     write_json(runtime / "dashboard.json", {"pid": os.getpid(), "process_start": process_start(os.getpid()),

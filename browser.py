@@ -104,6 +104,7 @@ class VirtualDisplay:
             self.process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             self.process.kill()
+            self.process.wait()
 
 
 class ChromePipe:
@@ -174,6 +175,7 @@ class ChromePipe:
             self.process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             self.process.kill()
+            self.process.wait()
         for fd in (self._read, self._write):
             try:
                 os.close(fd)

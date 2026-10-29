@@ -4,6 +4,10 @@ A CLI for messaging and monitoring coding session panes in Kilix, with an
 editable periodic prompt timer. Requires Python 3.10+ on Linux and Kilix Pane
 Center. Run inside Kilix so the terminal connection settings are inherited.
 
+Routes and the team launcher require a Kilix build with `session grid add`
+and the engine's `sessions` layout. Older builds using only `kilix @ launch`
+are not supported by these launchers. Python uses only its standard library.
+
 ## Setup
 
 From this checkout:
@@ -20,6 +24,22 @@ Use `./claudex` directly if an installed command already exists. Add
 and prompt files without replacing existing data. A new timer is paused;
 initialization does not start a daemon or contact Kilix. It honors the same
 configuration overrides as the other commands.
+
+Install the external tools for the commands you use:
+
+| Feature | Prerequisites |
+| --- | --- |
+| Pane messaging, limits and timer | Kilix and Pane Center (`kilix-panes` or `kilix panes`) |
+| Routes | Selected agent CLIs on PATH, with account access to the configured models |
+| Codex and companion usage | `tb` from tmux-tui, tmux, and the respective signed-in CLI |
+| Grok usage | The signed-in Grok CLI and network access to its billing endpoint |
+| Qwen usage | Chrome/Chromium; Xvfb for the default virtual display |
+| Five-pane team | The above, plus your own `omp-qwen` and companion Qwen launchers under `CLAUDEX_QWEN_DIR` |
+
+The optional Qwen launcher scripts are not bundled. Model IDs and effort names
+are configuration choices in the source; availability depends on your account
+and CLI version. Routes and team commands launch agents with approval bypass
+flags; use them only for work you have authorized with that level of access.
 
 Private app data defaults to `~/.local/gpu_terminal/kilix-apps/kilix-claudex/`.
 `GPU_TERMINAL_HOME` overrides the `~/.local/gpu_terminal` root. Configuration is
@@ -215,6 +235,13 @@ dialog is already open, the reading is refreshed with Left, then Right, and
 the screen is dumped a second later. Qwen still comes from its official
 usage page.
 
+The two tmux sessions must each contain one detached pane dedicated to usage.
+Readers lock each session under `${XDG_CACHE_HOME:-~/.cache}/claudex-status/`,
+check the pane identity before operations, and refuse drafts or an attached
+session. Detach after signing in. A readiness timeout or an unrecognized
+status screen returns a provider error instead of sending more keys. Other
+programs that ignore these locks can still race tmux input.
+
 ```sh
 claudex usage login                # open the Qwen usage page; Grok signs in with `grok login`
 claudex usage                      # one line: remaining 5h and weekly for codex, claude, grok, qwen
@@ -249,7 +276,8 @@ claudex usage --full --verbose     # full JSON plus the tmux /status screen
   `challenge` (a bot check; retry with `--display screen` and complete it),
   `unparsed` (rerun with `--debug`, which writes an outline of each page's JSON
   keys to `.loop/usage-debug-AGENT.json`, keeping numbers and timestamps and
-  redacting other text) or `error`.
+  redacting text values and the page title) or `error`. Debug output can still
+  contain site-defined key names and URL paths; treat it as private runtime data.
 - **Output:** the default is one line, so a model can read it without a
   large prompt. It lists remaining 5-hour and weekly percent for Codex,
   Claude, Grok, and Qwen, and leaves out model splits, reset times, and the
@@ -265,9 +293,14 @@ claudex usage --full --verbose     # full JSON plus the tmux /status screen
 
 ## Routing
 
-`claudex route` opens panes from a named algorithm. When a route checks usage,
-each agent's numbers stay valid for 30 minutes: a provider whose `checked_at`
-is younger than that is not read again. Worker tiers do not check usage.
+`claudex route` opens panes from a named algorithm. The panes join a kilix
+session grid named `claudex-route` (`kilix session grid add`). The first pane
+opens the grid, and a second pane joins it. The grid does not take focus, and
+a pane holds when its command exits. This needs a kilix that has session grids.
+
+When a route checks usage, each agent's numbers stay valid for 30 minutes:
+a provider whose `checked_at` is younger than that is not read again. Worker
+tiers do not check usage. Known window resets also invalidate the route cache.
 The dashboard's 15-second cache is a separate timer.
 
 ```sh
@@ -292,6 +325,20 @@ does not parse exits 1 and opens nothing. Codex, Claude, and Grok receive a
 parsed request as their initial prompt. `worker` takes the tier, then the
 request: `claudex route worker low "fix src/app.py"`.
 
+A max or security dry-run still refreshes stale usage, which can create and
+drive the dedicated tmux sessions or request billing data. Use a worker
+dry-run to check argument handling without account reads. `claudex usage show`
+reads the cache only. Team `plan` and `launch --dry-run` also refresh usage
+unless `--no-refresh` is given.
+
+Pass an exact prompt as one quoted argument. Several request arguments are
+joined with spaces. Put `--` before a prompt beginning with `-` (after the
+worker tier when using a worker route). The prompt is forwarded as one
+positional argument, including its whitespace and line endings. The existing
+file-path check validates references; it does not restrict what an agent may
+do. A partial launch reports the panes already created; inspect them before
+retrying so you do not launch duplicate work.
+
 Max uses remaining percent and never chooses Qwen. A missing or signed-out
 reading is left unknown. The checks run in this order:
 
@@ -314,7 +361,8 @@ Worker opens the Codex pane and the Claude pane together.
 
 Security opens one pane: `grok --yolo` while Grok has tokens, otherwise
 opus 5.5 at high effort, otherwise `gpt-6-astra` at high effort. Out of
-tokens means the five-hour or weekly window is fully used and has not reset.
+tokens means an account window (including a Grok monthly period) is fully used
+and has not reset.
 A signed-out agent is skipped.
 
 Kilix verbs such as `ls`, `focus`, `new-pane`, and `watch` are `kilix`
@@ -369,11 +417,14 @@ newline and therefore uses a snapshot file.
 ./claudex_team.py launch --dry-run      # print the kilix commands instead
 ./claudex_team.py launch --placeholder  # the same layout with shells, titled test-*
 ./claudex_team.py status                # find the panes; check layout, commands and tokens
+./claudex_team.py status --placeholder  # the same check for the test-* panes
 ```
 
-The tab uses kilix's splits layout. The orchestrator and companion are the two
-full-height columns of the left half. The right half is `claudex_worker_1`
-beside a column that stacks `claudex_worker_2` over `claudex_worker_3`.
+The tab is a kilix session grid named `claudex-team`, opened with
+`kilix session grid add` (it needs a kilix with session grids). The grid has
+two rows and fills them column by column in launch order: the orchestrator over
+the companion, `claudex_worker_1` over `claudex_worker_2`, then
+`claudex_worker_3` full height on the right.
 
 | Pane | Runs |
 | --- | --- |
@@ -385,17 +436,17 @@ beside a column that stacks `claudex_worker_2` over `claudex_worker_3`.
 
 - **Tokens:** the newest current evidence decides. Sources are the
   `claudex usage` reading (read again first when older than 15 minutes;
-  `--no-refresh` skips that and `--refresh` forces it; Codex comes from the
-  `codex_usage` tmux `/status` screen), grok's billing log, and
-  Codex rollouts for the Spark bucket (`codex_bengalfox`). A window at 100% that
+  `--no-refresh` skips that and `--refresh` forces it; Codex is the
+  `codex_usage` tmux `/status` screen and Grok is the CLI billing request),
+  grok's billing log, and Codex rollouts for the Spark bucket (`codex_bengalfox`). A window at 100% that
   hasn't reset means no tokens. When nothing is known, the primary agent runs.
 - **Panes:** each pane holds at a shell when its agent exits. The caller's
   `PATH` is passed so kilix finds the CLIs, and the Qwen launchers read their
   API key inside the pane. `CLAUDEX_QWEN_DIR` replaces `~/qwen-test`.
 - **Duplicates:** `launch` refuses while a pane with a team title exists,
   because claudex finds panes by title. `--allow-duplicates` overrides.
-- **Status:** exits 0 when each of the five panes exists once, in one tab, with
-  the team layout; otherwise 2.
+- **Status:** exits 0 when each of the five panes exists once, in one tab in
+  the `sessions` layout, in launch order; otherwise 2. Panes are found by title.
 
 ## Runtime state
 
@@ -408,6 +459,8 @@ All runtime files live in `.loop/` beside the resolved configuration file:
 | `last-send.json` | Latest attempted delivery, exact wire message and evidence. |
 | `last-send.lock` | Serializes brief evidence updates across sends and verification. |
 | `send-PANE_ID.lock` | Shared advisory lock for the entire send transaction. |
+| `dashboard.lock` | Prevents two servers from replacing one runtime's process record. |
+| `usage-pages.lock` | Serializes updates of the shared provider usage cache. |
 | `prompts/` | Immutable snapshots. Retained so pending messages can still read them; remove only after their work is finished. |
 
 Cooperating senders must select the same configuration directory to share
@@ -422,7 +475,8 @@ The attempt is saved in `last-send.json` when possible. Argument usage errors
 retain argparse's usage output; foreground `loop run` also streams event logs.
 
 Exit codes: 0 success/pending, 1 error before typing, 2 skipped/not idle,
-3 uncertain delivery after a text attempt, 130 interrupted.
+3 uncertain delivery after a text attempt (including interruption), 130 interrupted
+before a delivery attempt.
 
 ## Tests
 
@@ -435,3 +489,5 @@ session identity changes, concurrent verification, shared locking, exact prompt
 files, first-run data initialization, live configuration reloads and the
 detached timer lifecycle. It uses synthetic panes and a fake Kilix executable;
 it does not type into a live terminal.
+Dashboard tests bind temporary loopback ports. Usage-reader tests use scripted
+tmux responses and temporary lock directories; no account login is required.
