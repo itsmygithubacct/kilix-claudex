@@ -1,0 +1,8 @@
+Claudex
+
+This repository contains the Claudex Python sources, launcher, examples and tests.
+No agent executable, browser, tmux, Kilix implementation or Qwen launcher is
+bundled here. Install those programs separately under their own terms.
+
+Product names and protocol identifiers are used for interoperability. Their
+owners retain their respective rights; no affiliation or endorsement is implied.

@@ -528,3 +528,9 @@ tmux responses and temporary lock directories; no account login is required.
 Team tests cover twelve-session grids, per-session documents/model settings,
 exact prompt/add-on preservation, invalid plans and partial launch failures.
 Manual usage tests cover website labels, failed reads and noninteractive errors.
+
+## License
+
+Claudex is licensed under the [MIT License](LICENSE).
+Copyright (c) 2026 itsmygithubacct. External programs retain their own licenses;
+see [NOTICE](NOTICE).
