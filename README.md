@@ -452,7 +452,7 @@ overrides the defaults independently:
 | `effort` | Effort passed to the selected CLI; overrides the preset. |
 | `cwd` | Existing working directory, relative to the JSON file; defaults to `.`. |
 | `prompt` | Common prompt in defaults, or a unique replacement for this session. Empty string clears it. |
-| `title` | Session-only unique pane title; defaults to `NAME-NUMBER`. |
+| `title` | Session-only unique pane title, at most 200 UTF-8 bytes; defaults to `NAME-NUMBER`. |
 | `document` | Session-only existing file, relative to its cwd. Each assigned document must be distinct. |
 | `prompt_addon` | Session-only instructions appended after the prompt and document reference. |
 

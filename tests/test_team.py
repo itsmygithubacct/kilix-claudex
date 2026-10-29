@@ -77,6 +77,13 @@ class TeamTests(unittest.TestCase):
             self.plan([{'document': 'doc 0.txt'}, {'document': 'missing.txt'}], resolver=resolver)
         resolver.assert_not_called()
 
+    def test_later_title_exceeding_kilix_limits_is_rejected_before_account_reads(self):
+        for title in ('x' * 201, '🙂' * 51, 'bad\x85title'):
+            resolver = Mock()
+            with self.subTest(title=title), self.assertRaisesRegex(team.TeamError, '200 UTF-8 bytes'):
+                self.plan([{}, {'title': title}], resolver=resolver)
+            resolver.assert_not_called()
+
     def test_auto_selection_uses_settings_once_for_each_tier(self):
         resolver = Mock(return_value=route.choose_worker('low', 'claude'))
         plan = self.plan([{}, {}], worker_provider='claude', resolver=resolver)

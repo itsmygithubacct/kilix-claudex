@@ -25,7 +25,7 @@ def _text(value, label, *, empty=False):
 
 def _path(value, base, label, *, directory=False):
     text = _text(value, label)
-    if any(ord(char) < 32 or ord(char) == 127 for char in text):
+    if any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in text):
         raise TeamError(f"{label} contains control characters")
     path = Path(text).expanduser()
     path = (path if path.is_absolute() else base / path).resolve()
@@ -57,8 +57,9 @@ def read_spec(path):
             raise TeamError(f"session {index} has unknown fields or is not an object")
         item = {**defaults, **row}
         title = _text(item.get("title", f"{name}-{index}"), f"session {index} title")
-        if any(ord(char) < 32 or ord(char) == 127 for char in title) or title in titles:
-            raise TeamError("session titles must be unique and contain no control characters")
+        if (len(title.encode("utf-8")) > 200 or title in titles
+                or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in title)):
+            raise TeamError("session titles must be unique, at most 200 UTF-8 bytes, and contain no control characters")
         titles.add(title)
         cwd = _path(item.get("cwd", "."), path.parent, f"{title} cwd", directory=True)
         provider = item.get("provider", "auto")
@@ -70,7 +71,7 @@ def read_spec(path):
         for field in ("model", "effort"):
             if field in item:
                 token = _text(item[field], f"{title} {field}")
-                if token.startswith("-") or any(char.isspace() or ord(char) < 32 or ord(char) == 127
+                if token.startswith("-") or any(char.isspace() or ord(char) < 32 or 127 <= ord(char) <= 159
                                                 for char in token):
                     raise TeamError(f"{title}: {field} must be one identifier")
         prompt = _text(item.get("prompt", ""), f"{title} prompt", empty=True)
