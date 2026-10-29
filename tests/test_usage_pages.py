@@ -326,22 +326,22 @@ class CommandTests(unittest.TestCase):
                 patch.object(claude_status, "read", return_value=claude), \
                 patch.object(grok_status, "read", return_value=grok) as grok_read:
             status, output = self.run_main(providers.COMPANION_ID, providers.GROK_ID, "--display", "headless")
-        self.assertEqual(status, 2)  # the session window has nothing remaining
+        self.assertEqual(status, 1)  # Grok needs manual input from an interactive terminal
         read.assert_not_called()
         grok_read.assert_called_once()
-        self.assertEqual(output.strip(), "claude 5h 0")
+        self.assertEqual(output.strip(), "claude 5h 0; grok input_required")
         status, verbose_line = self.run_main("show", providers.COMPANION_ID, providers.GROK_ID, "--verbose")
-        self.assertEqual(verbose_line.strip(), "claude 5h 0; grok login_required")
+        self.assertEqual(verbose_line.strip(), "claude 5h 0; grok input_required")
         cached = json.loads((self.config.parent / ".loop" / "usage-pages.json").read_text())
         self.assertEqual(cached["providers"][providers.COMPANION_ID]["screen"], "secret screen")
         status, output = self.run_main("show", providers.GROK_ID)
         self.assertEqual(status, 1)  # nothing readable among the shown agents
-        self.assertEqual(output.strip(), "")
+        self.assertEqual(output.strip(), "grok input_required")
         status, output = self.run_main("show", providers.GROK_ID, "--verbose")
-        self.assertEqual(output.strip(), "grok login_required")
+        self.assertEqual(output.strip(), "grok input_required")
         status, full = self.run_main("show", providers.COMPANION_ID, providers.GROK_ID, "--full")
         loaded = json.loads(full)
-        self.assertEqual(loaded["providers"][providers.GROK_ID]["status"], "login_required")
+        self.assertEqual(loaded["providers"][providers.GROK_ID]["status"], "input_required")
         self.assertNotIn("screen", loaded["providers"][providers.COMPANION_ID])
         self.assertEqual(loaded["providers"][providers.COMPANION_ID]["windows"][0]["remaining_percent"], 0.0)
         status, human = self.run_main("show", providers.COMPANION_ID, "--human")

@@ -1,0 +1,25 @@
+{
+  "name": "document-review",
+  "defaults": {
+    "provider": "codex",
+    "model": "gpt-6.1-terra",
+    "effort": "high",
+    "cwd": "..",
+    "prompt": "Read your assigned document and report a concise review. Do not modify files."
+  },
+  "sessions": [
+    {
+      "title": "review-readme",
+      "document": "README.md",
+      "prompt_addon": "Focus on whether a new user can follow the installation instructions."
+    },
+    {
+      "title": "review-prompt",
+      "provider": "claude",
+      "model": "claude-sonnet-5-5",
+      "effort": "medium",
+      "document": "examples/prompt.txt",
+      "prompt_addon": "Focus on the scope and stopping conditions of the periodic prompt."
+    }
+  ]
+}

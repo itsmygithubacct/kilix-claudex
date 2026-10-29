@@ -44,10 +44,6 @@ OMP_AGENT_DIR = ".omp/agent"
 # omp providers that bill a Qwen Token Plan: a models.yml custom provider and omp's built-in one.
 QWEN_OMP_PROVIDERS = ("qwen-token-plan", "alibaba-token-plan")
 
-# The team tab (claudex_team.py): the companion pane's command and model, and the
-# ~/qwen-test launchers that run the companion CLI and omp against the Qwen Token Plan.
+# Companion executable and permission mode used by routes and team plans.
 COMPANION_COMMAND = "claude"
-COMPANION_TEAM_MODEL = "claude-opus-5"
 COMPANION_SKIP_PERMISSIONS = "--dangerously-skip-permissions"
-QWEN_COMPANION_LAUNCHER = "claude-qwen"
-QWEN_OMP_LAUNCHER = "omp-qwen"

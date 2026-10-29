@@ -115,20 +115,14 @@ class ChoiceTests(unittest.TestCase):
         self.assertEqual(decision["sessions"][0]["agent"], COMPANION_ID)
         self.assertEqual(decision["skipped"], ["grok login_required"])
 
-    def test_worker_tiers_launch_both_sides(self):
-        low = route.choose_worker("low")
-        self.assertEqual([(s["model"], s["effort"]) for s in low["sessions"]],
-                         [("gpt-6-luna", "max"), ("claude-sonnet-5-5", "low")])
-        mid = route.choose_worker("mid")
-        self.assertEqual([(s["model"], s["effort"]) for s in mid["sessions"]],
-                         [("gpt-6.1-terra", "high"), ("claude-sonnet-5-5", "medium")])
-        high = route.choose_worker("high")
-        self.assertEqual([(s["model"], s["effort"]) for s in high["sessions"]],
-                         [("gpt-6.1-sol", "high"), ("claude-sonnet-5-5", "high")])
-        top = route.choose_worker("max")
-        self.assertEqual([(s["model"], s["effort"]) for s in top["sessions"]],
-                         [("gpt-6.1-sol", "max"), ("claude-sonnet-5-5", "max")])
-        self.assertIn("--dangerously-skip-permissions", top["sessions"][1]["argv"])
+    def test_worker_tiers_launch_only_the_selected_provider(self):
+        for tier, choices in route.WORKERS.items():
+            for agent, model, effort in choices:
+                with self.subTest(tier=tier, agent=agent):
+                    sessions = route.choose_worker(tier, agent)["sessions"]
+                    self.assertEqual(len(sessions), 1)
+                    self.assertEqual((sessions[0]["agent"], sessions[0]["model"], sessions[0]["effort"]),
+                                     (agent, model, effort))
 
 
 class CacheTests(unittest.TestCase):
@@ -215,20 +209,21 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         self.assertEqual(decision["sessions"][0]["agent"], GROK_ID)
 
-    def test_worker_does_not_read_usage_and_opens_both_panes(self):
+    def test_worker_reads_usage_and_opens_one_selected_pane(self):
         launch = Launch()
         decision = route.run("worker", "low", cache=self.cache, cwd=Path(self.folder.name), now=NOW,
                              readers=self.readers(), launch=launch)
-        self.assertEqual(self.calls, [])
-        self.assertEqual(decision["window_ids"], [401, 402])
+        self.assertEqual(self.calls, [CODEX_ID, COMPANION_ID])
+        self.assertEqual(decision["window_ids"], [401])
         self.assertEqual(launch.calls[0][:4], ("grid", "add", "--name", "claudex-route"))
-        self.assertIn("--new", launch.calls[0])
-        self.assertIn("--into", launch.calls[1])
-        self.assertEqual(launch.calls[1][launch.calls[1].index("--into") + 1], "401")
-        self.assertNotIn("--location=vsplit", launch.calls[1])
-        self.assertIn("--", launch.calls[1])
-        self.assertTrue(route.format_line(decision).startswith(
-            "opened worker low codex gpt-6-luna max; claude claude-sonnet-5-5 low"))
+        self.assertTrue(route.format_line(decision).startswith("opened worker low codex gpt-6-luna max"))
+
+    def test_explicit_worker_preference_does_not_need_usage(self):
+        decision = route.run("worker", "low", cache=self.cache, cwd=Path(self.folder.name), now=NOW,
+                             readers=self.readers(), launch=Launch(), provider=COMPANION_ID)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(len(decision["sessions"]), 1)
+        self.assertEqual(decision["sessions"][0]["agent"], COMPANION_ID)
 
     def test_dry_run_prints_the_choice_without_launching(self):
         self.write(usage((CODEX_ID, [window("weekly", 10)]),
@@ -344,15 +339,15 @@ class RequestTests(unittest.TestCase):
         launch = Launch()
         prompt = f"fix {self.note}"
         decision = route.run("worker", "low", cache=self.cache, cwd=self.root, now=NOW,
-                             readers=self.readers(), launch=launch, dry_run=True, prompt=prompt)
+                             readers=self.readers(), launch=launch, dry_run=True, prompt=prompt, provider=CODEX_ID)
         self.assertEqual(launch.calls, [])
         self.assertEqual(self.calls, [])
         line = route.format_line(decision)
         self.assertTrue(line.startswith(
-            "would open worker low codex gpt-6-luna max; claude claude-sonnet-5-5 low"))
+            "would open worker low codex gpt-6-luna max"))
         self.assertIn(f"parse ok {self.note.resolve()}", line)
         self.assertEqual(decision["sessions"][0]["argv"][-1], prompt)
-        self.assertEqual(decision["sessions"][1]["argv"][-1], prompt)
+        self.assertEqual(len(decision["sessions"]), 1)
         record = route.public_record(decision)
         self.assertTrue(record["request"]["ok"])
         self.assertEqual(record["request"]["files"], [str(self.note.resolve())])
@@ -360,7 +355,7 @@ class RequestTests(unittest.TestCase):
     def test_a_bad_request_does_not_open_a_pane(self):
         launch = Launch()
         decision = route.run("worker", "low", cache=self.cache, cwd=self.root, now=NOW,
-                             readers=self.readers(), launch=launch, prompt="just do it")
+                             readers=self.readers(), launch=launch, prompt="just do it", provider=CODEX_ID)
         self.assertEqual(launch.calls, [])
         line = route.format_line(decision)
         self.assertIn("would open worker low codex gpt-6-luna max", line)
@@ -375,24 +370,24 @@ class RequestTests(unittest.TestCase):
         with patch("sys.stdout", out):
             code = route_command(Namespace(
                 name="worker", request=["low", f"fix {self.note}"], dry_run=True, json=False,
-                cwd=self.root), Path("."))
+                cwd=self.root, provider=CODEX_ID), Path("."))
         self.assertEqual(code, 0)
         text = out.getvalue()
         self.assertIn("gpt-6-luna", text)
-        self.assertIn("claude-sonnet-5-5", text)
+        self.assertNotIn("claude-sonnet-5-5", text)
         self.assertIn("parse ok", text)
         out = StringIO()
         with patch("sys.stdout", out):
             code = route_command(Namespace(
                 name="worker", request=["high", "fix /no/such/claudex-route.py"], dry_run=True, json=True,
-                cwd=self.root), Path("."))
+                cwd=self.root, provider=CODEX_ID), Path("."))
         self.assertEqual(code, 1)
         record = json.loads(out.getvalue())
         self.assertFalse(record["request"]["ok"])
         self.assertIn("missing", record["request"]["reason"])
         self.assertEqual(record["sessions"][0]["model"], "gpt-6.1-sol")
         self.assertEqual(record["sessions"][0]["effort"], "high")
-        self.assertEqual(record["sessions"][1]["model"], "claude-sonnet-5-5")
+        self.assertEqual(len(record["sessions"]), 1)
 
 
 class CommandTests(unittest.TestCase):

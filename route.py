@@ -15,7 +15,9 @@ signed-out, or failed reading is not treated as zero.
 3. Claude's 5-hour reading is over 50: opus 5.5 max.
 4. Otherwise gpt-6-astra max.
 
-``worker`` opens both sides of a tier and does not read usage.
+``worker`` opens one provider from the selected tier. An explicit provider
+setting skips usage; auto uses the Codex/Claude comparison from max.
+Failed readings prompt for the percentages shown on the provider website.
 ``security`` opens one session: Grok, else opus 5.5 high, else gpt-6-astra high.
 Use ``kilix grammar``, ``kilix needle``, and ``kilix shell`` for tools in
 the caller's pane.
@@ -46,6 +48,7 @@ import subprocess
 import grok_status
 from providers import CODEX_ID, COMPANION_COMMAND, COMPANION_ID, COMPANION_SKIP_PERMISSIONS, GROK_ID
 import usage_pages
+import usage_input
 
 USAGE_TTL = 30 * 60
 ROUTE_NAMES = ("max", "worker", "security")
@@ -74,6 +77,19 @@ WORKERS = {
 
 class RouteError(Exception):
     pass
+
+
+def worker_setting(config_path: Path) -> str:
+    try:
+        config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return "auto"
+    except (OSError, ValueError) as error:
+        raise RouteError(f"cannot read routing settings: {error}") from error
+    routing = config.get("routing", {}) if isinstance(config, dict) else None
+    if not isinstance(routing, dict) or routing.get("worker_provider", "auto") not in ("auto", CODEX_ID, COMPANION_ID):
+        raise RouteError("routing.worker_provider must be auto, codex or claude")
+    return routing.get("worker_provider", "auto")
 
 
 def _compact(value):
@@ -148,20 +164,26 @@ def default_readers() -> dict:
     return {CODEX_ID: codex_status.read, COMPANION_ID: claude_status.read, GROK_ID: grok_status.read}
 
 
-def ensure_usage(names, cache: Path, *, now: float, readers) -> tuple[dict, list]:
+def ensure_usage(names, cache: Path, *, now: float, readers, manual=None) -> tuple[dict, list]:
     """Reuse providers younger than 30 minutes. Read only the stale names."""
     usage = load_usage(cache)
-    stale = [name for name in names if not fresh(_provider(usage, name), now)]
+    stale = [name for name in names if usage_input.needs_input(_provider(usage, name))
+             or not fresh(_provider(usage, name), now)]
     if not stale:
         return usage, []
     report = {"read_at": now, "display": "direct", "providers": {}}
     for name in stale:
         try:
             entry = readers[name]()
-        except KeyError as error:
-            raise RouteError(f"no usage reader for {name}") from error
-        if not isinstance(entry, dict):
-            raise RouteError(f"usage reader for {name} did not return an object")
+        except Exception:
+            entry = {"status": "error", "windows": []}
+        if usage_input.needs_input(entry):
+            try:
+                entry = (manual or usage_input.read_manual)(name, entry, now=now)
+            except usage_input.ManualUsageRequired as error:
+                raise RouteError(str(error)) from error
+            if usage_input.needs_input(entry):
+                raise RouteError(f"no usable percentages supplied for {name}")
         if not isinstance(entry.get("checked_at"), (int, float)):
             entry = {**entry, "checked_at": now}
         report["providers"][name] = entry
@@ -289,12 +311,14 @@ def choose_security(usage: dict, *, now: float) -> dict:
             "sessions": [_session(CODEX_ID, ASTRA, "high", title="claudex-route-security")]}
 
 
-def choose_worker(tier: str) -> dict:
+def choose_worker(tier: str, provider: str = CODEX_ID) -> dict:
     if tier not in WORKERS:
         raise RouteError(f"claudex route worker needs {', '.join(WORKER_TIERS)}")
-    sessions = [_session(agent, model, effort, title=f"claudex-route-worker-{tier}-{agent}")
-                for agent, model, effort in WORKERS[tier]]
-    return {"reason": "worker pair", "skipped": [], "sessions": sessions}
+    if provider not in (CODEX_ID, COMPANION_ID):
+        raise RouteError("worker provider must be codex or claude")
+    agent, model, effort = next(item for item in WORKERS[tier] if item[0] == provider)
+    return {"reason": f"selected {provider} worker", "skipped": [],
+            "sessions": [_session(agent, model, effort, title=f"claudex-route-worker-{tier}-{agent}")]}
 
 
 def _ages(usage: dict, names, now: float) -> dict:
@@ -402,19 +426,19 @@ def kilix_launch(*args: str) -> dict:
     return value
 
 
-def open_sessions(sessions, *, cwd: Path, launch) -> tuple[list, list]:
+def open_sessions(sessions, *, cwd: Path, launch, name="claudex-route") -> tuple[list, list]:
     """Open the first session as a new grid tab; later sessions join that grid.
 
     ``launch`` is ``kilix session`` and returns the JSON receipt. The grid does
     not take focus, and a pane holds when its command exits.
     """
-    tab = "claudex-route"
+    tab = name
     ids: list = []
     commands = []
     for index, session in enumerate(sessions):
         where = ["--new"] if index == 0 else ["--into", str(ids[0])]
         args = ["grid", "add", "--name", tab, *where, "--title", session["title"],
-                "--cwd", str(cwd), "--env", f"PATH={os.environ.get('PATH', '')}",
+                "--cwd", str(session.get("cwd", cwd)), "--env", f"PATH={os.environ.get('PATH', '')}",
                 "--", *session["argv"]]
         commands.append(args)
         if launch is None:
@@ -434,7 +458,7 @@ def open_sessions(sessions, *, cwd: Path, launch) -> tuple[list, list]:
 
 def run(name: str, tier: str | None = None, *, cache: Path, cwd: Path, now: float | None = None,
         readers=None, launch=None, dry_run: bool = False, grok_home=None,
-        prompt: str | None = None) -> dict:
+        prompt: str | None = None, provider: str = "auto", manual=None) -> dict:
     """Choose a route and open it. ``launch`` receives the kilix arguments."""
     import time
 
@@ -444,26 +468,38 @@ def run(name: str, tier: str | None = None, *, cache: Path, cwd: Path, now: floa
         raise RouteError(f"claudex route worker needs {', '.join(WORKER_TIERS)}")
     if name != "worker" and tier is not None:
         raise RouteError(f"claudex route {name} does not take a tier")
+    if provider not in ("auto", CODEX_ID, COMPANION_ID) or (name != "worker" and provider != "auto"):
+        raise RouteError("--provider is a worker setting: auto, codex or claude")
     now = time.time() if now is None else now
     readers = default_readers() if readers is None else readers
     usage: dict = {}
     refreshed: list = []
     consulted: list = []
     if name == "worker":
-        decision = choose_worker(tier)
+        if provider == "auto":
+            consulted = [CODEX_ID, COMPANION_ID]
+            usage, refreshed = ensure_usage(consulted, cache, now=now, readers=readers, manual=manual)
+            # Workers use the existing two-provider comparison; no Grok branch.
+            selection = choose_max({"providers": {key: _provider(usage, key) for key in consulted}},
+                                   now=now, grok_model=lambda: (None, None))
+            provider = selection["sessions"][0]["agent"]
+            decision = choose_worker(tier, provider)
+            decision["reason"] = selection["reason"].replace("default astra", "default codex worker")
+        else:
+            decision = choose_worker(tier, provider)
     elif name == "max":
         consulted = [CODEX_ID, COMPANION_ID]
-        usage, refreshed = ensure_usage(consulted, cache, now=now, readers=readers)
+        usage, refreshed = ensure_usage(consulted, cache, now=now, readers=readers, manual=manual)
         if _both_under(usage):
-            usage, more = ensure_usage([GROK_ID], cache, now=now, readers=readers)
+            usage, more = ensure_usage([GROK_ID], cache, now=now, readers=readers, manual=manual)
             refreshed = [*refreshed, *more]
             consulted.append(GROK_ID)
         decision = choose_max(usage, now=now, grok_model=lambda: grok_target(grok_home))
     else:
         consulted = [GROK_ID]
-        usage, refreshed = ensure_usage(consulted, cache, now=now, readers=readers)
+        usage, refreshed = ensure_usage(consulted, cache, now=now, readers=readers, manual=manual)
         if not usable(_provider(usage, GROK_ID), now):
-            usage, more = ensure_usage([COMPANION_ID], cache, now=now, readers=readers)
+            usage, more = ensure_usage([COMPANION_ID], cache, now=now, readers=readers, manual=manual)
             refreshed = [*refreshed, *more]
             consulted.append(COMPANION_ID)
         decision = choose_security(usage, now=now)

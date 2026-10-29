@@ -1,7 +1,8 @@
 # Claudex
 
-A CLI for messaging and monitoring coding session panes in Kilix, with an
-editable periodic prompt timer. Requires Python 3.10+ on Linux and Kilix Pane
+A CLI for launching, messaging and monitoring coding sessions in Kilix, with
+usage-based routing, configurable teams and an editable periodic prompt timer.
+Requires Python 3.10+ on Linux and Kilix Pane
 Center. Run inside Kilix so the terminal connection settings are inherited.
 
 Routes and the team launcher require a Kilix build with `session grid add`
@@ -34,11 +35,11 @@ Install the external tools for the commands you use:
 | Codex and companion usage | `tb` from tmux-tui, tmux, and the respective signed-in CLI |
 | Grok usage | The signed-in Grok CLI and network access to its billing endpoint |
 | Qwen usage | Chrome/Chromium; Xvfb for the default virtual display |
-| Five-pane team | The above, plus your own `omp-qwen` and companion Qwen launchers under `CLAUDEX_QWEN_DIR` |
+| Team grid (1–12 sessions) | Kilix session grids and the selected agent CLIs on PATH |
 
-The optional Qwen launcher scripts are not bundled. Model IDs and effort names
-are configuration choices in the source; availability depends on your account
-and CLI version. Routes and team commands launch agents with approval bypass
+Model IDs and effort names are configurable per team session; routes use the
+presets documented below. Availability depends on your account and CLI version.
+Routes and team commands launch agents with approval bypass
 flags; use them only for work you have authorized with that level of access.
 
 Private app data defaults to `~/.local/gpu_terminal/kilix-apps/kilix-claudex/`.
@@ -247,6 +248,7 @@ claudex usage login                # open the Qwen usage page; Grok signs in wit
 claudex usage                      # one line: remaining 5h and weekly for codex, claude, grok, qwen
 claudex usage codex claude         # those two sessions only, no browser
 claudex usage grok                 # the grok CLI billing request, no browser
+claudex usage manual codex claude  # enter percentages from the websites directly
 claudex usage show                 # the last reading, without opening a browser or tmux
 claudex usage status               # profile path, whether it's open, time of the last reading
 claudex usage --json               # the same short reading as one JSON object
@@ -255,6 +257,21 @@ claudex usage --human              # table of the 5h and weekly rows
 claudex usage --human --used       # that table as used percent
 claudex usage --full --verbose     # full JSON plus the tmux /status screen
 ```
+
+If an automatic read fails or yields no usable percentages, the command asks
+for that provider's website percentages in the terminal. It prints the page
+URL and asks for the 5-hour/current-session and weekly/all-models values. Grok
+asks whether its displayed period is weekly or monthly and collects that value.
+Codex defaults to percent **left**; the others default to percent **used**.
+Enter values such as `35`, `35% used`, or `65% left`; an explicit label overrides
+the default. Enter `unknown` for a window the website does not show. All-unknown
+answers or cancellation stop routing before a pane opens. This does not open
+a browser or sign in for you. `usage manual` skips automatic reads entirely.
+
+Manual values are cached with their entry time and used by the same routing
+algorithm. They have no inferred reset time. A noninteractive command returns
+an `input_required` status and a `claudex usage manual PROVIDER` instruction on
+stderr instead of waiting for input. Run that command in a terminal and retry.
 
 - **Profile:** `usage-browser/` in the app data directory, mode 0700. It holds
   your login for the Qwen site; claudex never reads its cookies. Grok uses
@@ -272,11 +289,11 @@ claudex usage --full --verbose     # full JSON plus the tmux /status screen
   window, and Current week is the weekly window. Grok `creditUsagePercent`
   and `currentPeriod` come from the CLI billing response. Qwen comes from the
   JSON its page requests: `per5HourPercentage` and `per1WeekPercentage`.
-- **Statuses:** `login_required` (run `claudex usage login AGENT`),
-  `challenge` (a bot check; retry with `--display screen` and complete it),
-  `unparsed` (rerun with `--debug`, which writes an outline of each page's JSON
-  keys to `.loop/usage-debug-AGENT.json`, keeping numbers and timestamps and
-  redacting text values and the page title) or `error`. Debug output can still
+- **Automatic read failures:** sign-in requirements, bot challenges, parse
+  failures and provider errors trigger manual entry. `--debug` writes an
+  outline of each page's JSON keys to `.loop/usage-debug-AGENT.json`, keeping
+  numbers and timestamps and redacting text values and the page title.
+  Debug output can still
   contain site-defined key names and URL paths; treat it as private runtime data.
 - **Output:** the default is one line, so a model can read it without a
   large prompt. It lists remaining 5-hour and weekly percent for Codex,
@@ -289,26 +306,28 @@ claudex usage --full --verbose     # full JSON plus the tmux /status screen
   percent, and `--remaining` is the default. The tmux screen is stored in
   the cache and printed only with `--full --verbose` or `--human --verbose`.
   The latest reading per agent is kept in `.loop/usage-pages.json`.
-  Exit codes: 0 read, 2 a window is fully used, 1 nothing could be read.
+  Exit codes: 0 read, 2 a window is fully used, 1 manual input is still required
+  or nothing could be read. Input requirements take precedence over exhaustion.
 
 ## Routing
 
-`claudex route` opens panes from a named algorithm. The panes join a kilix
-session grid named `claudex-route` (`kilix session grid add`). The first pane
-opens the grid, and a second pane joins it. The grid does not take focus, and
-a pane holds when its command exits. This needs a kilix that has session grids.
+`claudex route` opens one session selected by a named algorithm. It creates a
+Kilix session grid named `claudex-route` (`kilix session grid add`). The grid
+does not take focus, and the pane holds when its command exits.
 
 When a route checks usage, each agent's numbers stay valid for 30 minutes:
-a provider whose `checked_at` is younger than that is not read again. Worker
-tiers do not check usage. Known window resets also invalidate the route cache.
+a valid provider reading whose `checked_at` is younger than that is not read
+again. Known window resets also invalidate the route cache. Failed readings
+ask for manual website percentages as described above.
 The dashboard's 15-second cache is a separate timer.
 
 ```sh
 claudex route max                  # one session
-claudex route worker low           # both workers
+claudex route worker low           # one worker, selected by settings/usage
 claudex route worker mid
 claudex route worker high
 claudex route worker max
+claudex route worker mid --provider claude  # override the configured provider
 claudex route security             # one session, along a fallback chain
 claudex route max --dry-run        # print the model; open nothing
 claudex route max "fix src/app.py" --dry-run
@@ -316,7 +335,7 @@ claudex route max --json           # the choice, the reason, and the numbers use
 ```
 
 `--dry-run` prints the model it would open and does not open a pane. A request
-after the route name is checked first. It parses when it names at least one
+after the route name is checked before opening a pane. It parses when it names at least one
 file path and every path is an existing file. A path starts with `/`, `~/`,
 `./`, or `../`, or contains a slash. Quote a path that has spaces. Relative
 paths resolve from `--cwd`. The next line is `parse ok` and the files, or
@@ -325,11 +344,10 @@ does not parse exits 1 and opens nothing. Codex, Claude, and Grok receive a
 parsed request as their initial prompt. `worker` takes the tier, then the
 request: `claudex route worker low "fix src/app.py"`.
 
-A max or security dry-run still refreshes stale usage, which can create and
-drive the dedicated tmux sessions or request billing data. Use a worker
-dry-run to check argument handling without account reads. `claudex usage show`
-reads the cache only. Team `plan` and `launch --dry-run` also refresh usage
-unless `--no-refresh` is given.
+A dry-run that selects by usage still refreshes stale readings, which can
+drive the dedicated tmux sessions, request billing data or ask for percentages.
+Use `claudex route worker low --provider codex --dry-run` to check argument
+handling without account reads. `claudex usage show` reads the cache only.
 
 Pass an exact prompt as one quoted argument. Several request arguments are
 joined with spaces. Put `--` before a prompt beginning with `-` (after the
@@ -339,8 +357,8 @@ file-path check validates references; it does not restrict what an agent may
 do. A partial launch reports the panes already created; inspect them before
 retrying so you do not launch duplicate work.
 
-Max uses remaining percent and never chooses Qwen. A missing or signed-out
-reading is left unknown. The checks run in this order:
+Max uses remaining percent and never chooses Qwen. A window explicitly entered
+as `unknown` stays unknown. The checks run in this order:
 
 1. Both weekly readings are known and each is under 20, and Grok still has
    weekly remaining: Grok's latest model at max, or xhigh when that model's
@@ -350,7 +368,12 @@ reading is left unknown. The checks run in this order:
 3. Claude's 5-hour reading is over 50: opus 5.5 max.
 4. Otherwise `gpt-6-astra` max.
 
-Worker opens the Codex pane and the Claude pane together.
+Worker opens exactly one pane. Set `routing.worker_provider` in `loop.json` to
+`auto` (default), `codex` or `claude`; `--provider` overrides it for one command.
+An explicit provider skips usage reads. In auto mode the Codex/Claude weekly
+comparison, Claude 5-hour check and default above select the provider, then
+the requested tier selects its model and effort. Auto workers do not use the
+Grok branch of max routing.
 
 | tier | Codex | Claude |
 | --- | --- | --- |
@@ -409,44 +432,55 @@ newline and therefore uses a snapshot file.
 
 ## Team tab
 
-`claudex_team.py` opens the five-pane team tab and checks on it later.
+`claudex team` opens 1–12 individually configured sessions in one Kilix tab
+grid. Start with [examples/team.json](examples/team.json), edit it, then inspect
+the fully resolved plan before launching:
 
 ```sh
-./claudex_team.py plan                  # which agent each pane would run, with the token checks
-./claudex_team.py launch                # open the claudex-team tab
-./claudex_team.py launch --dry-run      # print the kilix commands instead
-./claudex_team.py launch --placeholder  # the same layout with shells, titled test-*
-./claudex_team.py status                # find the panes; check layout, commands and tokens
-./claudex_team.py status --placeholder  # the same check for the test-* panes
+claudex team plan examples/team.json --json
+claudex team launch examples/team.json
 ```
 
-The tab is a kilix session grid named `claudex-team`, opened with
-`kilix session grid add` (it needs a kilix with session grids). The grid has
-two rows and fills them column by column in launch order: the orchestrator over
-the companion, `claudex_worker_1` over `claudex_worker_2`, then
-`claudex_worker_3` full height on the right.
+The JSON file has `name`, shared `defaults`, and a `sessions` array. Each session
+overrides the defaults independently:
 
-| Pane | Runs |
+| Field | Meaning |
 | --- | --- |
-| `claudex-orchestrator` | `codex --yolo -m gpt-6-astra -c model_reasoning_effort=max` |
-| `claudex-companion` | the companion CLI on the model named in `providers.py`, with permissions skipped |
-| `claudex_worker_1` | `grok --yolo` while grok has tokens, else `~/qwen-test/omp-qwen --here max -- --approval-mode=yolo` |
-| `claudex_worker_2` | the `~/qwen-test` companion-CLI launcher with `--here max`, with permissions skipped |
-| `claudex_worker_3` | `codex --yolo -m gpt-5.3-codex-spark` while Spark has tokens, else the omp Qwen fallback |
+| `provider` | `codex`, `claude`, `grok`, or `auto` (default). Auto uses the worker setting/algorithm. |
+| `tier` | `low`, `mid`, `high`, `max`; defaults to `low`. Selects a worker preset for Codex/Claude. |
+| `model` | Explicit model ID; requires an explicit provider. Overrides the tier preset. |
+| `effort` | Effort passed to the selected CLI; overrides the preset. |
+| `cwd` | Existing working directory, relative to the JSON file; defaults to `.`. |
+| `prompt` | Common prompt in defaults, or a unique replacement for this session. Empty string clears it. |
+| `title` | Session-only unique pane title; defaults to `NAME-NUMBER`. |
+| `document` | Session-only existing file, relative to its cwd. Each assigned document must be distinct. |
+| `prompt_addon` | Session-only instructions appended after the prompt and document reference. |
 
-- **Tokens:** the newest current evidence decides. Sources are the
-  `claudex usage` reading (read again first when older than 15 minutes;
-  `--no-refresh` skips that and `--refresh` forces it; Codex is the
-  `codex_usage` tmux `/status` screen and Grok is the CLI billing request),
-  grok's billing log, and Codex rollouts for the Spark bucket (`codex_bengalfox`). A window at 100% that
-  hasn't reset means no tokens. When nothing is known, the primary agent runs.
-- **Panes:** each pane holds at a shell when its agent exits. The caller's
-  `PATH` is passed so kilix finds the CLIs, and the Qwen launchers read their
-  API key inside the pane. `CLAUDEX_QWEN_DIR` replaces `~/qwen-test`.
-- **Duplicates:** `launch` refuses while a pane with a team title exists,
-  because claudex finds panes by title. `--allow-duplicates` overrides.
-- **Status:** exits 0 when each of the five panes exists once, in one tab in
-  the `sessions` layout, in launch order; otherwise 2. Panes are found by title.
+The initial prompt combines the exact base prompt, an instruction to read that
+session's document by absolute path, and its add-on, separated by blank lines.
+The agent reads the document from disk; Claudex does not copy its contents or
+grant access beyond the session's existing filesystem permissions. No document
+is required when the prompt alone is sufficient. Keep private team plans and
+assignments outside a public checkout.
+
+Use shared defaults for a uniform prompt, per-session `prompt` values for
+unique instructions, or shared prompts with individual `prompt_addon` values.
+When changing providers, also override any model/effort defaults that belong
+to the previous provider. Model availability and effort support depend on the
+installed CLI and account; the plan shows the exact arguments but cannot
+verify access to a model.
+
+`plan` opens no panes. Explicit Codex/Claude models do not read accounts;
+`auto` may refresh usage and prompt for percentages. Grok's default model comes
+from its local configuration. All paths, fields and the 1–12 count are checked
+before account reads or launches. Unknown fields, duplicate titles and repeated
+document paths (including symlinks) are rejected.
+
+`launch` creates a new grid with the first session and adds the rest to that
+same grid in list order, using Kilix's `sessions` layout. Each pane receives its
+own cwd and the caller's PATH, holds after exit, and preserves the caller's
+focus. Existing pane titles block launch. If a launch fails partway through,
+the error lists confirmed pane IDs; inspect those panes before retrying.
 
 ## Runtime state
 
@@ -491,3 +525,6 @@ detached timer lifecycle. It uses synthetic panes and a fake Kilix executable;
 it does not type into a live terminal.
 Dashboard tests bind temporary loopback ports. Usage-reader tests use scripted
 tmux responses and temporary lock directories; no account login is required.
+Team tests cover twelve-session grids, per-session documents/model settings,
+exact prompt/add-on preservation, invalid plans and partial launch failures.
+Manual usage tests cover website labels, failed reads and noninteractive errors.

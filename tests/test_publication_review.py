@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 import claude_status
-import claudex_team
+import team
 import codex_status
 import grok_status
 import limits
@@ -22,6 +22,59 @@ from test_codex_status import Session as CodexSession, Clock as CodexClock
 
 
 class LaunchBoundaryTests(unittest.TestCase):
+    def test_cli_team_launch_delivers_twelve_independent_sessions_to_one_fake_grid(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            project = root / 'work with spaces'
+            project.mkdir()
+            rows = []
+            for index in range(12):
+                document = project / f'assignment {index}.txt'
+                document.write_text('Synthetic assignment\n')
+                rows.append({'title': f'unit-{index}', 'cwd': str(project),
+                             'document': document.name, 'prompt_addon': f'Unique add-on {index}'})
+            rows[1].update(provider='claude', model='claude-sonnet-5-5', effort='medium',
+                           prompt='  replacement\r\nwith $HOME and `literal`  ')
+            spec = root / 'team.json'
+            spec.write_text(json.dumps({'name': 'fixture', 'defaults': {'provider': 'codex',
+                                          'model': 'gpt-6.1-terra', 'effort': 'high',
+                                          'prompt': 'Common prompt'}, 'sessions': rows}))
+            fake = root / 'kilix'
+            fake.write_text('#!/usr/bin/env python3\nimport json,os,sys\n'
+                            'from pathlib import Path\n'
+                            'log=Path(os.environ["REVIEW_ARGV"])\n'
+                            'count=len(log.read_text().splitlines()) if log.exists() else 0\n'
+                            'with log.open("a") as out: out.write(json.dumps(sys.argv[1:])+"\\n")\n'
+                            'print("[]" if sys.argv[1:]==["@","ls"] else '
+                            'json.dumps({"pane":{"pane_id":100+count}}))\n')
+            fake.chmod(0o700)
+            log = root / 'argv.jsonl'
+            env = {'PATH': str(root) + ':/usr/bin:/bin', 'HOME': str(root),
+                   'LANG': 'C.UTF-8', 'REVIEW_ARGV': str(log)}
+            prefix = [sys.executable, '-B', pane_loop.__file__, '--config', str(root/'loop.json'), 'team']
+            preview = subprocess.run([*prefix, 'plan', str(spec), '--json'], env=env,
+                                     capture_output=True, text=True, timeout=15)
+            self.assertEqual(preview.returncode, 0, preview.stderr + preview.stdout)
+            self.assertFalse(log.exists())
+            plan = json.loads(preview.stdout)
+            done = subprocess.run([*prefix, 'launch', str(spec), '--json'], env=env,
+                                  capture_output=True, text=True, timeout=15)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            result = json.loads(done.stdout)
+            self.assertEqual(result['window_ids'], list(range(101, 113)))
+            calls = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertEqual(calls[0], ['@', 'ls'])
+            self.assertEqual(len(calls), 13)
+            for index, args in enumerate(calls[1:]):
+                self.assertEqual(args[:5], ['session', 'grid', 'add', '--name', 'fixture'])
+                self.assertEqual(args[5:6] if index == 0 else args[5:7],
+                                 ['--new'] if index == 0 else ['--into', '101'])
+                self.assertEqual(args[args.index('--cwd') + 1], str(project))
+                self.assertEqual(args[args.index('--') + 1:], plan['sessions'][index]['argv'])
+                self.assertIn(f'assignment {index}.txt', args[-1])
+                self.assertTrue(args[-1].endswith(f'Unique add-on {index}'))
+            self.assertIn(rows[1]['prompt'], calls[2][-1])
+
     def test_cli_delivers_exact_arguments_to_a_fake_kilix_process(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -39,11 +92,11 @@ class LaunchBoundaryTests(unittest.TestCase):
             env = {'PATH': str(root) + ':/usr/bin:/bin', 'HOME': str(root),
                    'LANG': 'C.UTF-8', 'REVIEW_ARGV': str(log)}
             done = subprocess.run([sys.executable, '-B', pane_loop.__file__, '--config', str(root/'loop.json'),
-                                   'route', '--json', '--cwd', str(cwd), 'worker', 'low', '--', prompt],
+                                   'route', '--json', '--provider', 'codex', '--cwd', str(cwd), 'worker', 'low', '--', prompt],
                                   env=env, capture_output=True, text=True, timeout=15)
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
             calls = [json.loads(line) for line in log.read_text().splitlines()]
-            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(calls), 1)
             for args in calls:
                 self.assertEqual(args[:3], ['session', 'grid', 'add'])
                 self.assertEqual(args[args.index('--cwd') + 1], str(cwd.resolve()))
@@ -61,7 +114,7 @@ class LaunchBoundaryTests(unittest.TestCase):
         calls = []
         cwd = Path('/tmp/work with spaces')
         prompt = 'fix ./code.py\r\n  exact whitespace  '
-        sessions = route._with_prompt(route.choose_worker("low")["sessions"], prompt)
+        sessions = route._with_prompt(route.choose_worker("low")["sessions"] + route.choose_worker("low", "claude")["sessions"], prompt)
         def launch(*args):
             calls.append(args)
             return {"pane": {"pane_id": 100 + len(calls)}}
@@ -73,7 +126,7 @@ class LaunchBoundaryTests(unittest.TestCase):
             self.assertEqual(args[-2:], ("--", prompt))
 
     def test_partial_launch_failure_names_confirmed_panes(self):
-        sessions = route.choose_worker("low")["sessions"]
+        sessions = route.choose_worker("low")["sessions"] + route.choose_worker("low", "claude")["sessions"]
         with self.assertRaisesRegex(route.RouteError, r"\[101\].*inspect"):
             route.open_sessions(sessions, cwd=Path('/tmp'), launch=unittest.mock.Mock(
                 side_effect=[{"pane": {"pane_id": 101}}, route.RouteError("failed")]))
@@ -84,10 +137,10 @@ class LaunchBoundaryTests(unittest.TestCase):
                                 launch=lambda *args: {"pane": {"pane_id": True}})
 
     def test_invalid_team_listing_cannot_bypass_duplicate_check(self):
-        client = claudex_team.Kilix()
-        with patch.object(client, "run", return_value='{"error":"unavailable"}'):
-            with self.assertRaises(claudex_team.TeamError):
-                client.ls()
+        result = subprocess.CompletedProcess([], 0, '{"error":"unavailable"}', '')
+        with patch.object(team.subprocess, "run", return_value=result):
+            with self.assertRaises(team.TeamError):
+                team.existing_titles()
 
 
 class UsageStateTests(unittest.TestCase):

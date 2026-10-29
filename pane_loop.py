@@ -28,6 +28,8 @@ import grok_status
 from providers import CODEX_ID, COMPANION_ID, GROK_ID, LIMIT_PROVIDERS, SUPPORTED, USAGE_PAGES
 import route
 import usage_pages
+import usage_input
+import team
 
 
 ALIASES = {"orchestrator": "claudex-orchestrator", "companion": "claudex-companion"}
@@ -35,7 +37,7 @@ ALIASES = {"orchestrator": "claudex-orchestrator", "companion": "claudex-compani
 MIN_INTERVAL_MINUTES = 0.01
 DEFAULT_DASHBOARD_PORT = 8797
 DEFAULT_TARGETS = ["orchestrator", "companion"]
-USAGE_ACTIONS = ("read", "login", "show", "status")
+USAGE_ACTIONS = ("read", "manual", "login", "show", "status")
 
 
 def default_config():
@@ -832,7 +834,7 @@ def parser():
     provider.add_argument("which", nargs="?", choices=(*LIMIT_PROVIDERS, "all"), default="all")
     usage = commands.add_parser(
         "usage", help="read Codex and Claude from tmux, Grok from the grok CLI login, and Qwen from its usage page")
-    usage.add_argument("words", nargs="*", metavar="[read|login|show|status] [AGENT ...]",
+    usage.add_argument("words", nargs="*", metavar="[read|manual|login|show|status] [AGENT ...]",
                        help=f"action (default read) and agents: {', '.join(LIMIT_PROVIDERS)} (default all)")
     output = usage.add_mutually_exclusive_group()
     output.add_argument("--json", action="store_true", help="print the short reading as one JSON object")
@@ -858,6 +860,14 @@ def parser():
     route_cmd.add_argument("--json", action="store_true",
                            help="print the choice, the reason, and the usage numbers")
     route_cmd.add_argument("--cwd", type=Path, help="working directory for the new panes (default: here)")
+    route_cmd.add_argument("--provider", choices=("auto", CODEX_ID, COMPANION_ID),
+                           help="worker provider override (default: routing.worker_provider or auto)")
+    teams = commands.add_parser("team", help="plan or launch 1–12 configured sessions in one tab grid")
+    team_actions = teams.add_subparsers(dest="action", required=True)
+    for action in ("plan", "launch"):
+        command = team_actions.add_parser(action)
+        command.add_argument("file", type=Path, help="JSON team plan with shared defaults and sessions")
+        command.add_argument("--json", action="store_true", help="print full session arguments and prompts")
     return result
 
 
@@ -937,21 +947,33 @@ def usage_command(args, config_path, runtime):
         print(f"cache {value['cache']}")
         print(f"last read {value['last_read_at']}")
         return 0
-    if action == "read":
+    if action in ("read", "manual"):
         if not math.isfinite(args.timeout) or args.timeout <= 0:
             raise LoopError("--timeout must be a positive number of seconds")
         pages = [name for name in providers if name not in direct_note]
-        if pages:
-            report = usage_pages.read_usage(pages, profile, display=args.display, binary=args.browser,
-                                            timeout=args.timeout, debug_dir=runtime if args.debug else None)
-        else:
-            report = {"read_at": time.time(), "display": "direct", "providers": {}}
-        if CODEX_ID in providers:
-            report["providers"][CODEX_ID] = codex_status.read()
-        if COMPANION_ID in providers:
-            report["providers"][COMPANION_ID] = claude_status.read()
-        if GROK_ID in providers:
-            report["providers"][GROK_ID] = grok_status.read()
+        report = {"read_at": time.time(), "display": "manual" if action == "manual" else "direct", "providers": {}}
+        if action == "read":
+            if pages:
+                try:
+                    report = usage_pages.read_usage(pages, profile, display=args.display, binary=args.browser,
+                                                    timeout=args.timeout, debug_dir=runtime if args.debug else None)
+                except (browser.BrowserError, OSError, ValueError):
+                    report["providers"].update({name: {"status": "error", "windows": []} for name in pages})
+            readers = {CODEX_ID: codex_status.read, COMPANION_ID: claude_status.read, GROK_ID: grok_status.read}
+            for name in providers:
+                if name in readers:
+                    try:
+                        report["providers"][name] = readers[name]()
+                    except Exception:
+                        report["providers"][name] = {"status": "error", "windows": []}
+        for name in providers:
+            entry = report["providers"].get(name)
+            try:
+                report["providers"][name] = usage_input.fallback(name, entry)
+            except usage_input.ManualUsageRequired as error:
+                report["providers"][name] = {"status": "input_required", "reason": str(error),
+                                             "windows": [], "checked_at": time.time()}
+                print(f"claudex: {error}", file=sys.stderr)
         usage_pages.merge_cache(cache, report)
     else:
         try:
@@ -980,10 +1002,12 @@ def usage_command(args, config_path, runtime):
     else:
         print(usage_pages.format_summary(report, basis=basis, verbose=args.verbose))
     readable = any(entry.get("status") == "ok" for entry in report["providers"].values())
+    if any(entry.get("status") == "input_required" for entry in report["providers"].values()):
+        return 1
     return 2 if usage_pages.exhausted(report) else 0 if readable else 1
 
 
-def route_command(args, runtime):
+def route_command(args, runtime, config_path=None):
     words = list(args.request) if getattr(args, "request", None) is not None else None
     if words is None:
         words = []
@@ -999,8 +1023,11 @@ def route_command(args, runtime):
     if not cwd.is_dir():
         raise LoopError(f"--cwd is not a directory: {cwd}")
     try:
+        provider = getattr(args, "provider", None)
+        if provider is None:
+            provider = route.worker_setting(config_path) if config_path and args.name == "worker" else "auto"
         value = route.run(args.name, tier, cache=runtime / "usage-pages.json", cwd=cwd,
-                          dry_run=args.dry_run, prompt=prompt)
+                          dry_run=args.dry_run, prompt=prompt, provider=provider)
     except route.RouteError as error:
         raise LoopError(str(error)) from error
     if args.json:
@@ -1114,7 +1141,17 @@ def main(argv=None):
         elif args.command == "usage":
             return usage_command(args, config_path, runtime)
         elif args.command == "route":
-            return route_command(args, runtime)
+            return route_command(args, runtime, config_path)
+        elif args.command == "team":
+            plan = team.make_plan(args.file, cache=runtime / "usage-pages.json",
+                                  worker_provider=route.worker_setting(config_path))
+            value = team.launch(plan) if args.action == "launch" else plan
+            if not args.json:
+                for index, session in enumerate(value["sessions"], 1):
+                    print(f"{index:>2} {session['title']}: {session['agent']} {session['model']} "
+                          f"{session['effort']} | cwd {session['cwd']} | document {session['document'] or '-'}")
+                print(f"{value['status']} {len(value['sessions'])} session(s) in grid {value['name']}")
+                return 0
         elif args.command == "dashboard":
             if args.action in ("serve", "start", "open"):
                 if not 0 <= args.port <= 65535:
@@ -1143,7 +1180,7 @@ def main(argv=None):
         print(json.dumps({"status": "skipped", "reason": str(error), "text_attempted": False,
                           "text_may_remain": False}))
         return 2
-    except (LoopError, browser.BrowserError, OSError, ValueError) as error:
+    except (LoopError, route.RouteError, browser.BrowserError, OSError, ValueError) as error:
         value = getattr(error, "evidence", None) or {"status": "error", "reason": str(error),
                                                     "text_attempted": False, "text_may_remain": False}
         print(json.dumps(value, ensure_ascii=False))
